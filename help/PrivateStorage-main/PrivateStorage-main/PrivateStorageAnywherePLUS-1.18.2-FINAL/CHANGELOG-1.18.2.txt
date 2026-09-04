@@ -1,0 +1,143 @@
+================================================================================
+ Private Storage Anywhere PLUS - changes for Crimson Desert 1.18.2
+ Unofficial build on top of Stevi's v1.5.10.  Build tag: CD 1.18.AS
+================================================================================
+
+ Written in the style of the author's own changelog, so it can be read
+ alongside the v1.5.10 / v1.5.9 / v1.5.8 entries on the Nexus page.
+
+ Starting point: v1.5.10 (released 12 July 2026) works on the game versions it
+ was built for. On 1.18.2 the storage hotkeys did nothing, and the paths that
+ did fire crashed the game. Four separate faults, one new option.
+
+
+--------------------------------------------------------------------------------
+ FIXED - No storage panel opened at all on 1.18.2
+--------------------------------------------------------------------------------
+
+ Both mode-state helpers (SafeSetupModeForWarehouse and SafeRestoreMode) locate
+ the game-mode and sub-mode fields by scanning a fixed window: offsets within
+ +/-0x200 of 0xC00. On 1.18.2 Pearl Abyss moved those fields well outside it -
+ mode 0x18, sub-mode 0x19, mode flags 0x21, sub-type flags 0x28, dirty 0x4B -
+ so both helpers matched nothing and returned without writing.
+
+ Nothing errored. The mod set no sub-mode, the panel-manager never saw "store"
+ in the mode tag list, and no view was ever mounted. From the outside the
+ hotkey simply did nothing.
+
+ The window check is now rebased at zero, and the whole layout is re-derived
+ from the game's own mode tag-list builder at build time - the same class of
+ self-locating the author already uses for the warehouse-mode index in v1.5.10,
+ applied to the fields that index operates on.
+
+
+--------------------------------------------------------------------------------
+ FIXED - Crash to desktop on the first storage open
+--------------------------------------------------------------------------------
+
+ Two writes inside the panel-init routine were valid on earlier builds and
+ became fatal on 1.18.2. Both were found by reading the game's own minidumps.
+
+ - The donation-state clear writes a 48-bit "empty" sentinel into
+   controller+0x330. On 1.18.2 that field holds a live pointer, so the write
+   corrupted it and the game faulted the moment it was used.
+
+ - The modal-dialog clear writes NULL into controller+0x258, which the game
+   then dereferences with no null check.
+
+ Both writes are skipped. Consequence of the first one: the donation footer is
+ no longer cleared, so it may show on the Private panel. That is cosmetic and
+ far preferable to the crash.
+
+
+--------------------------------------------------------------------------------
+ FIXED - The storage sub-mode lost to cinematic mode
+--------------------------------------------------------------------------------
+
+ Opening a panel asked the game's menu layer for state 1. The game answers any
+ request other than 3 by setting sub-type flag index 4 - "alert, cinema,
+ subtitle" - and the mode resolver takes the FIRST set index, so cinema (4)
+ always beat store (5). The panel could not mount even once the sub-mode fix
+ above was in place.
+
+ The menu layer is now left entirely alone. Its idle request value is 3, which
+ is the branch that clears cinema anyway. Nothing is set on open, so nothing
+ needs restoring on close - which also removes the v1.5.6 leaked-menu-layer
+ failure mode by construction rather than by cleanup.
+
+
+--------------------------------------------------------------------------------
+ FIXED - The housing chest 10 -> 1000 expansion had silently stopped applying
+--------------------------------------------------------------------------------
+
+ This is the author's own feature from v1.5.10. Two small drifts disabled it.
+
+ - The resolver's secondary check requires a "mov r64,[reg+disp8]" with a
+   displacement of 0x60, 0x70 or 0x78 within 0x60 bytes of the anchor. 1.18.2
+   compiles the relevant instruction as "add r11,[r10+0x78]" - right register,
+   right displacement, different opcode - so the check rejected it and the
+   whole expansion path was skipped.
+
+ - The manager's entry array moved from mgr+0x50 to mgr+0x58.
+
+ Two bytes changed, plus one more to enable the write. All five housing chests
+ are back at 1000 slots, re-applied on open exactly as v1.5.10 intended.
+
+
+--------------------------------------------------------------------------------
+ NEW - PrivateStorageSlots  (not original behaviour, ships off)
+--------------------------------------------------------------------------------
+
+ A local addition, not part of the author's mod. The Nexus description lists
+ "Private Storage expansion mods" as a category the author has not tested and
+ will not support, so this is deliberately opt-in and reversible.
+
+     PrivateStorageSlots=1000        ; exact TOTAL, expansions included
+     PrivateStorageSlots=0           ; off, and restores the game's own value
+     PrivateStorageExpansions=-1     ; -1 = detect automatically
+
+ The game computes displayed capacity as base + expansions bought, holding the
+ result in a cached field on the player's storage record. The mod reads the
+ player's expansion count from the game's own container list, then sets both
+ numbers so they agree: base becomes (total - expansions), and the cached total
+ becomes the requested figure. Setting 0 writes both back - the original base
+ is captured the first time the mod reads it each launch, before it has written
+ anything, so the restore value is always the game's own.
+
+ Both writes are compare-then-write, so a save that never enabled the option is
+ never touched.
+
+
+--------------------------------------------------------------------------------
+ UNCHANGED FROM v1.5.10
+--------------------------------------------------------------------------------
+
+ All six panels and their hotkeys, keyboard modifiers, XInput bindings with
+ modifier support, PS5/PS4 HID bindings, ESC to close, the game's native
+ warehouse UI, per-panel INI configuration, INI hot-reload on F11, and the
+ safe-state blocking during cutscenes and minigames.
+
+ Two of the author's features degrade on 1.18.2 rather than working fully:
+ language auto-detect does not resolve, and the housing panel type resolver
+ falls back to a shared INI value. Both are documented in README.txt.
+
+
+--------------------------------------------------------------------------------
+ HOW IT IS BUILT
+--------------------------------------------------------------------------------
+
+ A Python patcher applied to the pristine v1.5.10 binary. It verifies the input
+ by SHA-256 and checks the exact expected bytes at every site before writing,
+ so a mismatch stops the build instead of producing a silently wrong file.
+
+   input   4F514298B2BC5DB7E804B0166AD2269BAE97A414F7DAE425A0F736CDA7F56F3E
+   output  A7F7D38169250E1FE1D570613369022CA4933721943E5C113687B7F9D0AA51EE
+
+ The new option's code lives in two sections appended to the file rather than
+ in reclaimed space inside it. Against the known-good baseline, the binary
+ differs only in two PE header fields, the two appended section headers, two
+ call displacements and the build tag - the original code is otherwise
+ byte-identical.
+
+ Patcher and full technical notes, including the wrong turns and how each was
+ caught, are in the source archive.

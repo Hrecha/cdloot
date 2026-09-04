@@ -1,0 +1,157 @@
+================================================================================
+  PrivateStorageAnywherePLUS - Crimson Desert 2.00
+  Changelog
+================================================================================
+
+RELEASE - Crimson Desert 2.00 compatibility
+  ASI SHA-256  C2B9848F33A3822532C563C31965F4DFF74B0D02A369AE7626D3E43056C49840
+  Built from the pristine v1.5.10 ASI
+               4F514298B2BC5DB7E804B0166AD2269BAE97A414F7DAE425A0F736CDA7F56F3E
+
+Tested on Crimson Desert 2.00: all six panels open and close, both capacity
+behaviours confirmed, no crash or freeze.
+
+
+--------------------------------------------------------------------------------
+  WHAT WAS BROKEN ON 2.00
+--------------------------------------------------------------------------------
+
+The 1.18.2 release crashed about one second after loading on 2.00, and it did so
+even with every feature turned off.
+
+Three separate faults, only one of them visible:
+
+  1. Three game addresses baked into the patch had moved. Two of them were
+     unconditional call targets; on 2.00 one no longer decoded as code at all
+     and the other landed mid-instruction.
+
+  2. The startup crash fired even with PrivateStorageSlots=0, because an earlier
+     change had removed the early-out so that 0 could still restore capacity.
+     A disabled feature was still walking to a stale address.
+
+  3. The mode-state field offsets had all moved.
+
+
+--------------------------------------------------------------------------------
+  WHAT CHANGED
+--------------------------------------------------------------------------------
+
+Addresses are derived, not typed
+
+  The patcher now takes the game executable as an argument and locates every
+  game-side target by its shape rather than its address - the call idiom that
+  feeds the inventory bucket lookup, a function prologue plus two body
+  instructions, a string with a code reference, and the UI mode-tag jump
+  tables. If an anchor cannot be found or is ambiguous, the build fails rather
+  than emitting something that will crash.
+
+  One address was removed entirely: the main-character global is now read from
+  the slot the mod already resolves and logs at runtime.
+
+"Off" means off again
+
+  PrivateStorageSlots=0 short-circuits before any game address is touched,
+  unless this process has already written a capacity value - in which case it
+  still restores. This is what makes the disabled case safe.
+
+The mode-state layout
+
+  Every field moved by a uniform +0x10 between 1.18.2 and 2.00:
+
+                 1.18.2   2.00
+    mode          0x18     0x28
+    sub-mode      0x19     0x29
+    flags[7]      0x21     0x31
+    subtypes[17]  0x28     0x38
+    dirty         0x4B     0x5B
+
+  Getting to that table took four builds. What made it hard is recorded below,
+  because the wrong turns are the useful part.
+
+Capacity, restated
+
+  The five housing chests (F5-F9) are expanded to 1000 slots unconditionally,
+  on a code path that runs before PrivateStorageSlots is read. Private Storage
+  (F4) is separately and optionally configurable, with 0 meaning "restore what
+  the game itself would have". The two features cannot affect each other.
+
+
+--------------------------------------------------------------------------------
+  THE FOUR BUILDS IT TOOK, AND WHAT EACH GOT WRONG
+--------------------------------------------------------------------------------
+
+AT   Derived the three moved addresses and the field layout. Loaded and ran on
+     2.00, but every open was refused: "BLOCKED: unsafe state (mode=0x00)".
+     Diagnosed at the time as the mod holding the wrong mode object. That
+     diagnosis was wrong, and it cost the next two builds.
+
+AU   A probe that searched for the right object by walking pointers out of the
+     mod's root object. Its only guard tested whether a value looked
+     pointer-shaped, which is worthless for arbitrary data. It read unmapped
+     memory, went into the game's crash handler, and hung for minutes. Withdrawn
+     and never reused.
+
+AV   Twelve fixed candidate chains instead of a search, with every single
+     dereference cleared by VirtualQuery first. Safe - it ran, abandoned six
+     chains, and did not fault. But its own log labels were wrong: the argument
+     list did not match the format string, so the sub-mode and flags were never
+     printed at all and the pass signal it was designed around could not have
+     appeared. Retracted.
+
+AW   Stopped guessing. Hooked the game's own mode-switch function with a
+     single 8-byte aligned write - atomic, so a function that runs every frame
+     can be patched safely - and recorded the object the game itself passes in.
+
+     The captured pointer was identical to the one the mod already had. The
+     route had been correct since AT. The real fault was elsewhere.
+
+AX   The mode offset. The game keeps a 17-byte array in that object and copies
+     it to a shadow slot 17 bytes further along once per switch. The tool that
+     derives the offsets looks for two adjacent bytes being written together -
+     which is exactly what the mode and sub-mode look like, and exactly what
+     every pair inside that shadow copy looks like too. Its guard accepted a
+     comparison against an unrelated object as evidence, so it locked onto the
+     shadow copy and the mod spent three builds reading "element 7 of last
+     frame's array" and calling it the mode. That value is zero, which is every
+     BLOCKED line since AT.
+
+     The mode is at +0x28 and the sub-mode at +0x29, confirmed three ways in the
+     game's own code: the two bytes it passes to the UI tag builder, the two
+     bytes it commits when a switch completes, and a test near the top of the
+     switch that only proceeds when +0x28 is 0 or 4.
+
+     Five bytes differ from AW. That is the whole fix.
+
+
+--------------------------------------------------------------------------------
+  HARDENING DONE ALONG THE WAY
+--------------------------------------------------------------------------------
+
+  * The offset derivation now requires the comparison's source to be a register
+    and to share a base register with the stores, rejects shadow-copy runs, and
+    prefers the pair the game hands to its tag builder. Two independent rules
+    now agree on the answer.
+
+  * The derived layout is cross-checked against the struct's internal spacing
+    (sub-mode = mode+1, flags = mode+9, subtypes = flags+7, dirty =
+    subtypes+0x23). These are checks that stop the build, never a source of
+    values. The AX defect broke one of them and would have been caught.
+
+  * The diagnostic probe no longer carries its own copy of the offsets. Two
+    sources of truth are why it agreed with the bug instead of exposing it. It
+    also now logs the discarded +0x50/+0x51 pair so the same class of error is
+    visible in a log rather than costing a test round.
+
+  * A build validator disassembles the produced file and checks the argument
+    marshalling, the frame arithmetic, the hook's displaced bytes, the absence
+    of stale 1.18.2 addresses, and the exact set of memory writes.
+
+
+--------------------------------------------------------------------------------
+  KNOWN, UNCHANGED
+--------------------------------------------------------------------------------
+
+  Two optional helper functions are not located on 2.00 and fall back; the
+  housing-chest type resolver is disabled and uses the INI instead; the first
+  housing panel of a session falls back to the INI for its panel id. All are
+  logged, all work. See README.txt.

@@ -1,0 +1,29 @@
+help/
+
+# Собранный релиз и архивы для Nexus - выкладываются файлами на самом Nexus,
+# в репозитории им делать нечего.
+release/
+
+# Результаты сборки
+build/
+*.asi
+*.dll
+*.exp
+*.lib
+*.obj
+*.pdb
+*.ilk
+
+# Логи игры и сохранённые сессии
+*.log
+CDLoot-session-*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Мусор редакторов и системы
+.vs/
+*.user
+Thumbs.db
+desktop.ini

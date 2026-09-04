@@ -139,6 +139,14 @@ static bool readable(const void *p, SIZE_T n) {
 // пропущенный объект, а не весь такт.
 static volatile LONG g_faults;
 
+// Сколько раз игра зовёт каждый наш перехват. Подбор идёт ровно с той
+// частотой, с какой срабатывает перехват, из которого зовётся drain_pending,
+// поэтому эти три числа прямо объясняют "собирает пачками".
+static volatile LONG g_hitArea, g_hitOwn, g_hitEnq;
+// Такты автосбора и реально отправленные действия за тот же срок:
+// без них не отличить "обходим редко" от "обходим часто, а брать нечего".
+static volatile LONG g_hitTick, g_hitSent, g_hitCand;
+
 static bool read_u32(const void *p, uint32_t *out) {
     if (!readable(p, 4)) return false;
     __try { *out = *(const uint32_t *)p; return true; }
@@ -235,11 +243,14 @@ static void *rip_target(unsigned char *insn, int dispOff, int insnLen) {
 }
 
 static bool resolve_functions() {
+    // Хвост шаблона - пролог desc_lookup, лежащего через 0x60 после tls_init.
+    // Последний байт - это регистр в movzx r??d,dx: на 2658 был D2 (r10d), на
+    // 2760 (2.01.00) стал DA (r11d). Оставлен подстановочным.
     unsigned char *tlsDesc = aob("tls+desc",
         "48 83 EC 28 BA 9C 00 00 00 65 48 8B 04 25 58 00 00 00 48 8B 08 8B 04 0A 39 05 ?? ?? ?? ?? "
         "7E ?? 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? FF 75 ?? 48 8D 0D ?? ?? ?? ?? "
         "E8 ?? ?? ?? ?? 90 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? 48 83 C4 28 C3 "
-        "CC CC CC CC CC CC 40 56 45 33 C9 44 0F B7 D2");
+        "CC CC CC CC CC CC 40 56 45 33 C9 44 0F B7 ??");
     if (tlsDesc) { g_fn.tlsInit = tlsDesc; g_fn.descLookup = tlsDesc + 0x60; }
     g_fn.allocEvent = aob("alloc_event",
         "48 89 5C 24 ?? 4C 89 44 24 ?? 57 48 83 EC 20 8B ?? BA ?? ?? 00 00");
@@ -247,8 +258,14 @@ static bool resolve_functions() {
         "48 89 5C 24 08 57 48 83 EC 20 48 8B ?? 38 65 48 8B 04 25 58 00 00 00");
     // Сигнатура попадает на 0xF байт внутрь тела функции - её начало лежит
     // раньше. Проверяем, что там действительно пролог, а не случайные байты.
+    // Пролог и кадр (sub rsp,50; vmovaps [rsp+40],xmm6) не менялись, а вот
+    // раскладка регистров после них - да. До 2658 шло
+    //     4D 8B ?? 44 8B ?? 48 8B ??
+    // на 2760 (2.01.00) компилятор выдал
+    //     4C 8B FA 48 8B F1 48 8B 3A 44 8B 77 18   (r15=rdx, rsi=rcx, rdi=[rdx], r14d=[rdi+18])
+    // Контекст тот же: счётчик по +0x108, массив сущностей по +0x110.
     unsigned char *areaHit = aob("area_sweep",
-        "55 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 50 C5 F8 29 74 24 40 4D 8B ?? 44 8B ?? 48 8B ??");
+        "55 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 50 C5 F8 29 74 24 40 4C 8B ?? 48 8B ?? 48 8B ?? 44 8B");
     if (areaHit) {
         unsigned char *start = areaHit - 0x0F;
         L("[aob] area_sweep начало = +0x%llX (байты %02X %02X %02X)",
@@ -257,9 +274,12 @@ static bool resolve_functions() {
     }
     // Эти две функции перехватывает AutoLoot: если он загружен, их прологи
     // изменены и сигнатура не совпадёт. Для разработки CDLoot его лучше убрать.
+    // На 2760 (2.01.00) "4C 8B FA" (mov r15,rdx) стал "4C 8B F2" (mov r14,rdx).
+    // Одних регистров мало - таких прологов три, поэтому шаблон продлён до
+    // чтения пятого аргумента (той самой семёрки) из [rbp+0x50]: он один.
     g_fn.ownCheck = aob("own_check",
         "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 55 41 54 41 55 41 56 41 57 48 8B EC "
-        "48 81 EC 80 00 00 00 49 8B F0 4C 8B FA");
+        "48 81 EC 80 00 00 00 49 8B ?? 4C 8B ?? 4C 8B ?? 0F B6 7D 50");
     g_fn.getPos = aob("get_pos",
         "40 53 48 83 EC 50 48 8B 41 68 48 8B 88 ?? 01 00 00 48 8B 01");
     // DESC_MASK и очередь берём из кода, а не зашиваем: они переезжают каждый патч.
@@ -289,6 +309,135 @@ static bool resolve_functions() {
               g_fn.descMask && g_fn.queue;
     L("[aob] итог: %s", ok ? "ключевые функции найдены" : "часть не найдена");
     return ok;
+}
+
+// ------------------------------------------------ менеджер акторов ----------
+// Контекст обхода раньше брался ТОЛЬКО из аргумента перехваченной функции, и
+// это оказалось самым хрупким местом мода. На 2.01.00 сигнатура обхода сошлась
+// с ЧУЖОЙ функцией: перехват встал, вызовы шли, а в rcx лежал посторонний
+// объект. Игрок в нём не находился, обход выходил на полпути, и мод молча не
+// собирал ничего - при том, что в логе все восемь сигнатур были "уникально".
+//
+// Менеджер акторов в процессе ровно один, и указатель на него лежит в глобале
+// образа. Ищем его по ИМЕНИ КЛАССА: имена в RTTI - символы из исходников игры,
+// они переживают патчи, в отличие от адресов и байтовых шаблонов.
+//
+//     ".?AVClientActorManager@pa@@" -> TypeDescriptor -> COL -> таблица
+//     методов -> глобал, в котором лежит объект с этой таблицей
+//
+// Список сущностей у менеджера лежит по +0x190 обычной тройкой
+// {штук, мест, массив} - её находит тот же перебор 0x100..0x200, что и раньше.
+static void **g_mgrSlot;        // глобал образа с указателем на менеджера
+
+// Таблицы методов менеджера. Ищутся один раз: имя класса и RTTI в образе
+// лежат неподвижно, а вот сам объект появляется позже.
+static unsigned char *g_mgrVt[4];
+static int  g_mgrVtN;
+static bool g_mgrVtDone;
+
+static void find_actor_manager_vtables(void) {
+    if (g_mgrVtDone) return;
+    g_mgrVtDone = true;
+    static const char NAME[] = ".?AVClientActorManager@pa@@";
+    const int nlen = (int)sizeof NAME;               // вместе с нулём
+    unsigned char *lim = g_game.base + g_game.size;
+
+    unsigned char *td = 0;
+    for (unsigned char *p = g_game.base; p + nlen < lim; p++) {
+        if (*p != '.' || memcmp(p, NAME, nlen) != 0) continue;
+        td = p - 0x10;                               // имя лежит по td+0x10
+        break;
+    }
+    if (!td) { L("[менеджер] класс ClientActorManager в образе не найден"); return; }
+    uint32_t tdRva = (uint32_t)(td - g_game.base);
+
+    // COL (_R4): сигнатура 1 по +0x00 и ссылка на дескриптор по +0x0C.
+    for (unsigned char *p = g_game.base; p + 0x18 < lim && g_mgrVtN < 4; p += 4) {
+        if (*(uint32_t *)(p + 0x0C) != tdRva || *(uint32_t *)p != 1) continue;
+        uint64_t colVa = (uint64_t)(uintptr_t)p;
+        for (unsigned char *q = g_game.base; q + 16 < lim; q += 8) {
+            if (*(uint64_t *)q != colVa) continue;
+            g_mgrVt[g_mgrVtN++] = q + 8;             // таблица идёт сразу за COL
+            break;
+        }
+    }
+    L("[менеджер] класс найден, таблиц методов: %d (первая +0x%llX)", g_mgrVtN,
+      g_mgrVtN ? (unsigned long long)(g_mgrVt[0] - g_game.base) : 0ull);
+}
+
+// Глобал с указателем на менеджера. Ищем ТОЛЬКО по записываемым секциям без
+// кода: глобалы игры лежат в .srdata (8 МБ), а не в .debug$P на четверть
+// гигабайта - с ним перебор стоил бы секунду вместо сотой доли.
+static void **find_actor_manager_slot(void) {
+    find_actor_manager_vtables();
+    if (!g_mgrVtN) return 0;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)g_game.base;
+    IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(g_game.base + dos->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    long cand = 0, live = 0, sects = 0;
+    for (int si = 0; si < nt->FileHeader.NumberOfSections; si++) {
+        DWORD ch = sec[si].Characteristics;
+        if (!(ch & IMAGE_SCN_MEM_WRITE) || (ch & IMAGE_SCN_MEM_EXECUTE)) continue;
+        unsigned char *b = g_game.base + sec[si].VirtualAddress;
+        unsigned char *e = b + sec[si].Misc.VirtualSize;
+        if (e > g_game.base + g_game.size) e = g_game.base + g_game.size;
+        sects++;
+        // По секции идём кусками, которые система считает отданными: у
+        // .srdata хвост за пределами файла, и упереться в незанятую страницу
+        // здесь означает исключение прямо посреди перебора.
+        for (unsigned char *rp = b; rp < e; ) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(rp, &mbi, sizeof mbi)) break;
+        unsigned char *rEnd = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
+        if (rEnd > e) rEnd = e;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) { rp = rEnd; continue; }
+        for (unsigned char *p = rp; p + 8 <= rEnd; p += 8) {
+            uint64_t v = *(uint64_t *)p;
+            if (v < 0x10000 || (v >> 47)) continue;
+            if (in_image((void *)(uintptr_t)v)) continue;
+            cand++;
+            // readable() здесь стоял зря и был дорог: указателей в .srdata
+            // сто сорок тысяч, а одна проверка памяти в этом процессе - 300
+            // мкс, то есть сорок секунд на перебор. Чтение и так укрыто
+            // перехватом исключения, оно и решает.
+            uint64_t head = 0;
+            __try { head = *(uint64_t *)(uintptr_t)v; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+            live++;
+            for (int i = 0; i < g_mgrVtN; i++) {
+                if (head != (uint64_t)(uintptr_t)g_mgrVt[i]) continue;
+                L("[менеджер] найден: глобал +0x%llX -> %p",
+                  (unsigned long long)(p - g_game.base), (void *)(uintptr_t)v);
+                return (void **)p;
+            }
+        }
+        rp = rEnd;
+        }
+    }
+    // Один раз рассказываем, почему не нашли: секций столько-то, указателей
+    // столько-то. Пусто в этих числах - значит ищем не там, а не "объекта нет".
+    static LONG told = 0;
+    if (InterlockedExchange(&told, 1) == 0)
+        L("[менеджер] пока не найден: секций %ld, указателей %ld, прочиталось %ld",
+          sects, cand, live);
+    return 0;
+}
+
+// Менеджера при старте игры ЕЩЁ НЕТ: мод поднимается за секунду, а мир
+// создаётся позже. Поэтому ищем не один раз на старте, а повторяем, пока не
+// найдём. Перебор идёт по восьми мегабайтам .srdata и стоит недорого.
+static void *actor_manager(void) {
+    if (!g_mgrSlot) {
+        static DWORD nextTry = 0;
+        DWORD now = GetTickCount();
+        if (nextTry && (LONG)(now - nextTry) < 0) return 0;
+        nextTry = now + 3000;
+        g_mgrSlot = find_actor_manager_slot();
+        if (!g_mgrSlot) return 0;
+    }
+    void *p = 0;
+    __try { p = *g_mgrSlot; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return readable(p, 0x200) ? p : 0;
 }
 
 // ------------------------------------------------------ раскладка сущности --
@@ -988,6 +1137,7 @@ static bool send_action(Action act, uint32_t targetEid, uint32_t playerEid,
         InterlockedExchange(&g_sendTid, (LONG)GetCurrentThreadId());
         ((FnEnqueue)g_fn.enqueue)(q, ev, desc, 0);
         InterlockedExchange(&g_sendTid, 0);
+        InterlockedIncrement(&g_hitSent);
         L("[send] ОТПРАВЛЕНО в очередь %p", q);
         ok = true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1166,6 +1316,7 @@ static const char *desc_name(void *d) {
 }
 
 extern "C" void __fastcall cdloot_on_enqueue(void *q, void *ev, void *desc, void *z) {
+    InterlockedIncrement(&g_hitEnq);
     (void)q; (void)z;
     // Сначала route: он нужен всегда, а не только во время записи.
     if (!InterlockedCompareExchange(&g_routeKnown, 0, 0)) {
@@ -1339,6 +1490,12 @@ static void notice(const char *text, UINT beep) {
     g_notice[sizeof g_notice - 1] = 0;
     g_noticeUntil = GetTickCount() + 2000;
     if (g_notifyOn) {
+        // Текст кладём на плашку СРАЗУ. Раньше его писал только обход сцены,
+        // а тот доходит до конца не всегда: не нашёлся игрок в контексте -
+        // и обход выходит на полпути. Окно при этом показывалось, но со
+        // старой строкой: обычно с той самой "CDLoot ready" от загрузки.
+        // Со стороны выглядело так, будто F10 и F11 ничего не делают.
+        hud_set("%s", g_notice);
         InterlockedExchange(&g_hudOn, 1);          // табличку показать
         MessageBeep(beep);
     }
@@ -2928,9 +3085,15 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
     if (hudTick) lastHud = now;
     LONG dumpEid = InterlockedCompareExchange(&g_dumpEid, 0, 0);
     if (!scanReq && !autoTick && !hudTick && !dumpEid) return;
+    if (autoTick) InterlockedIncrement(&g_hitTick);
     TickTimer tt(verbose ? "обзор F9" : (autoTick ? "автосбор" : "плашка"));
     LARGE_INTEGER ph0, ph1, ph2, ph3;
     QueryPerformanceCounter(&ph0);
+    // Контекст берём у менеджера акторов, а аргумент перехвата оставляем
+    // запасным путём: он верен ровно до тех пор, пока сигнатура обхода
+    // указывает на ту функцию, на которую мы думаем.
+    void *mgrCtx = actor_manager();
+    if (mgrCtx) ctx = mgrCtx;
     if (!ctx || !readable(ctx, 0x200)) { if (verbose) L("[scan] контекст нечитаем"); return; }
     unsigned char *c = (unsigned char *)ctx;
 
@@ -3066,7 +3229,41 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
     bool settling = now < holdUntil;
 
     QueryPerformanceCounter(&ph1);
-    if (!me) { if (verbose) L("[игрок] сущности с меткой 0xA0 в контексте нет"); return; }
+    if (!me) {
+        if (verbose) {
+            L("[игрок] сущности с меткой 0xA0 в контексте нет");
+            // Разведка на случай "игрока нет". Причин всего две, и различаются
+            // они одним взглядом: либо мы перехватили ЧУЖУЮ функцию и в rcx
+            // лежит посторонний объект, либо функция та, а смещение метки
+            // внутри сущности уехало. Имя класса из RTTI - символ из исходников
+            // игры, он между версиями не меняется, поэтому по нему видно сразу,
+            // акторы ли лежат в массиве.
+            L("[разведка] контекст %p, его класс %s",
+              c, rtti_short(c) ? rtti_short(c) : "имени нет");
+            for (int off = 0x100; off + 16 <= 0x200; off += 8) {
+                uint32_t count, cap; uint64_t data;
+                if (!read_u32(c + off, &count) || !read_u32(c + off + 4, &cap) ||
+                    !read_u64(c + off + 8, &data)) continue;
+                if (!count || !cap || count > cap || cap > 0x10000) continue;
+                if (!readable((void *)data, 8)) continue;
+                L("[разведка] +0x%03X: штук=%u мест=%u массив=%p",
+                  off, count, cap, (void *)data);
+                unsigned char **arr = (unsigned char **)data;
+                for (uint32_t i = 0; i < count && i < 6; i++) {
+                    uint64_t ep;
+                    if (!read_u64(arr + i, &ep)) break;
+                    unsigned char *e = (unsigned char *)ep;
+                    if (!readable(e, 0x100)) { L("[разведка]    [%u] %p - не читается", i, e); continue; }
+                    const char *cls = rtti_short(e);
+                    uint32_t a60 = 0, a58 = 0, a64 = 0;
+                    read_u32(e + 0x58, &a58); read_u32(e + 0x60, &a60); read_u32(e + 0x64, &a64);
+                    L("[разведка]    [%u] %p класс=%s +0x58=%08X +0x60=%08X +0x64=%08X",
+                      i, e, cls ? cls : "?", a58, a60, a64);
+                }
+            }
+        }
+        return;
+    }
     if (verbose) {
         L("[игрок] eid=%08X route=%08X тип=%02X  %s(%.1f, %.1f, %.1f)",
           playerEid, playerRoute, ent_type(me), haveMe ? "позиция " : "ПОЗИЦИИ НЕТ ", mp.x, mp.y, mp.z);
@@ -4149,6 +4346,7 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
             L("[scan] промахов чтения: %ld (это норма, если немного: массив живой)", f);
             toldFaults = f;
         }
+        if (autoTick) InterlockedExchangeAdd(&g_hitCand, (LONG)nn);
         if (m1 + m2 + m3 >= 8.0)
             L("[время] фазы: поиск игрока %.1f | список %.1f | подробности+плашка %.1f мс (объектов %d)",
               m1, m2, m3, nn);
@@ -4581,8 +4779,15 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
             if (already_searched(key)) continue;
             dup_watch(now, list[i].eid, list[i].parent, list[i].tid, list[i].cat2,
                       (uint8_t)act, list[i].d, list[i].name);
-            L("[авто] %s eid=%08X d=%.1f м тип=%u вид=%02X %s", act_name(act),
+            // РОДИТЕЛЬ пишется теперь всегда. Проверка родителя отсекает только
+            // СВОЁ (parent == игрок), а вещь, подвешенная к сундуку, ящику или
+            // чужому актору, её проходит. Если в этом поле окажется не ноль -
+            // мод берёт содержимое чужой ёмкости или снаряжение чужого актора,
+            // и лишние предметы у игрока берутся именно оттуда.
+            L("[авто] %s eid=%08X d=%.1f м тип=%u вид=%02X род=%08X кат=0x%02X к2=0x%02X %s",
+              act_name(act),
               list[i].eid, list[i].d, list[i].tid, list[i].gkind,
+              list[i].parent, list[i].cat, list[i].cat2,
               list[i].name ? list[i].name
                            : (list[i].nodeName ? list[i].nodeName : "без имени"));
             if (act == ACT_SEARCH) mark_searched(cand_key(list[i].eid, list[i].iid));
@@ -4634,7 +4839,13 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
 // похода в ядро, поэтому промах по указателю здесь - штатная ситуация:
 // такт пропускается, игра продолжает работать.
 // Исполнение отложенных решений - строго на игровом потоке.
+static volatile LONG g_draining;
+
 static void drain_pending(void) {
+    // Слив зовётся теперь из двух мест, и оба - игровой поток. Второго
+    // захода внутрь себя не допускаем: отправка события снова проходит через
+    // очередь игры, а та - через наш же перехват.
+    if (InterlockedCompareExchange(&g_draining, 1, 0) != 0) return;
     // Забираем ОБЕ очереди под замком и сразу освобождаем его: отправка зовёт
     // функции игры и может занять время, держать на ней замок незачем.
     PendArm arms[32]; int armN;
@@ -4658,9 +4869,11 @@ static void drain_pending(void) {
     for (int i = 0; i < actN; i++)
         send_action((Action)acts[i].act, acts[i].eid, acts[i].player,
                     acts[i].route, acts[i].mode, false);
+    InterlockedExchange(&g_draining, 0);
 }
 
 extern "C" void __fastcall cdloot_on_area(void *ctx, void *a2, void *a3, void *a4) {
+    InterlockedIncrement(&g_hitArea);
     InterlockedExchange(&g_gameTid, (LONG)GetCurrentThreadId());
     InterlockedExchangePointer((void * volatile *)&g_ctxLatest, ctx);
     __try {
@@ -4712,9 +4925,16 @@ static void own_body(void *a1, void *a2, void *a3, void *a4) {
 }
 
 extern "C" void __fastcall cdloot_on_own(void *a1, void *a2, void *a3, void *a4) {
+    InterlockedIncrement(&g_hitOwn);
+    InterlockedExchange(&g_gameTid, (LONG)GetCurrentThreadId());
     __try { own_body(a1, a2, a3, a4); } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedExchange(&g_ownLeft, 0);
     }
+    // Слить очередь ещё и отсюда - была попытка вылечить "собирает пачками".
+    // Счётчики показали, что лечить нечего: обход зовётся ~3700 раз в секунду,
+    // и очередь уходит в игру немедленно. Отправка событий из оракула - это
+    // заход в игровой код из чужого запроса, и ради ничего его держать не
+    // стоит. Убрано намеренно, чтобы не вернули "на всякий случай".
 }
 
 // ------------------------------------------- кто заряжает узел --------------
@@ -4884,6 +5104,35 @@ static DWORD WINAPI worker(LPVOID) {
                 L("[key] F11 - собрать пачку");
             }
             pF11b = f11b;
+        }
+
+        // Раз в пять секунд - частота перехватов. Подбор идёт со скоростью
+        // слива, а слив живёт в перехватах, поэтому эти три числа прямо
+        // объясняют "собирает пачками".
+        if (g_debug) {
+            static DWORD lastRate = 0;
+            DWORD nowR = GetTickCount();
+            if (!lastRate) lastRate = nowR;
+            if (nowR - lastRate >= 5000) {
+                L("[частота] за %lu мс: обход %ld, оракул %ld, очередь %ld | "
+                  "тактов автосбора %ld, кандидатов %ld, отправлено %ld",
+                  (unsigned long)(nowR - lastRate),
+                  InterlockedExchange(&g_hitArea, 0),
+                  InterlockedExchange(&g_hitOwn, 0),
+                  InterlockedExchange(&g_hitEnq, 0),
+                  InterlockedExchange(&g_hitTick, 0),
+                  InterlockedExchange(&g_hitCand, 0),
+                  InterlockedExchange(&g_hitSent, 0));
+                lastRate = nowR;
+            }
+        }
+
+        // Гаснет табличка тоже здесь, а не в обходе сцены: обход может не
+        // дойти до конца, и тогда уведомление висело бы до следующего
+        // удачного. Вычитание, а не сравнение - счётчик тиков переполняется.
+        if (!g_debug && g_notice[0] && (LONG)(GetTickCount() - g_noticeUntil) >= 0) {
+            g_notice[0] = 0;
+            InterlockedExchange(&g_hudOn, 0);
         }
 
         // Дальше - клавиши разработчика. Их много, они шумят в лог и часть из
@@ -5079,15 +5328,24 @@ CDEXPORT int CoreStart(const char *dir, int generation) {
     hook_prologue(g_ownHook, g_fn.ownCheck, (void *)cdloot_on_own, 15, "оракул воровства");
     // Диспетчер зарядки узла. Пролог: mov [rsp+18],rbx / mov [rsp+10],dl /
     // push rbp,rsi,rdi,r12 = ровно 15 байт, ссылок на rip нет.
+    // 2.01.00 (exe 2760): диспетчер пересобран целиком. Прежний пролог
+    //   48 89 5C 24 18 88 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ?? 48 81 EC 00 01 00 00
+    // исчез. Теперь функция начинается с записи режима (dl) и rcx в теневую
+    // область, восьми push и sub rsp,58; сидит по +0x205CD60. Виртуальный
+    // вызов внутри съехал с +0x830/+0x838 на +0x838/+0x840 - в таблицу
+    // добавили метод. Аргументы прежние: rcx объект, dl режим, r8 буфер,
+    // r9d eid. Байты регистров подстановочные.
     unsigned char *armFn = aob("зарядка узла",
-        "48 89 5C 24 18 88 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ?? 48 81 EC 00 01 00 00");
-    // 16 байт, не 15: на 15 разрезается пополам "push r13" (41 55), и возврат
-    // уходит в середину инструкции. Одна такая ошибка уже уронила игру.
-    //   48 89 5C 24 18 (5) + 88 54 24 10 (4) + 55 56 57 (3) + 41 54 (2) + 41 55 (2)
+        "88 54 24 10 48 89 4C 24 08 53 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 58 49 8B ?? 44 0F B6 ?? 4C 8B ??");
+    // 15 байт ровно по границе инструкций:
+    //   88 54 24 10 (4) + 48 89 4C 24 08 (5) + 53 55 56 57 (4) + 41 54 (2) = 15.
+    // Ни одной rip-относительной ссылки. Резать на 16 нельзя: "41 55"
+    // (push r13) разрежется пополам - такая ошибка уже роняла игру.
+    find_actor_manager_vtables();
     resolve_item_table();
     resolve_aim_query();
     g_armFn = armFn;
-    if (armFn) hook_prologue(g_armHook, armFn, (void *)cdloot_on_arm, 16, "зарядка узла");
+    if (armFn) hook_prologue(g_armHook, armFn, (void *)cdloot_on_arm, 15, "зарядка узла");
     InterlockedExchange(&g_ownLeft, 30);
 
     // Слушатель включён сразу и молча ждёт: как только вы подберёте что-то
@@ -5105,10 +5363,15 @@ CDEXPORT int CoreStart(const char *dir, int generation) {
         L("[время] одна проверка памяти = %.1f мкс",
           (double)(b.QuadPart - a.QuadPart) * 1000000.0 / g_qpcFreq / 1000.0);
     }
+    // Секция плашки - ДО рабочего потока: он с первого же оборота может
+    // нажать клавишу и позвать notice(), а тот теперь пишет текст сам.
+    InitializeCriticalSection(&g_hudCs);
     InterlockedExchange(&g_running, 1);
     g_thread = CreateThread(0, 0, worker, 0, 0, 0);
-    InitializeCriticalSection(&g_hudCs);
-    hud_set("CDLoot готов");
+    // Табличка загрузки - единственное, что игрок видит до первого нажатия,
+    // и она одна осталась мимо T(): на английской системе мод здоровался
+    // по-русски. cfg_load выше уже выставил g_lang, так что выбор работает.
+    hud_set("%s", T("CDLoot ready", "CDLoot готов"));
     InterlockedExchange(&g_hudRunning, 1);
     g_hudThread = CreateThread(0, 0, hud_thread, 0, 0, 0);
 #ifdef CDLOOT_PLUGIN

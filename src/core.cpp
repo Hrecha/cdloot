@@ -139,6 +139,14 @@ static bool readable(const void *p, SIZE_T n) {
 // пропущенный объект, а не весь такт.
 static volatile LONG g_faults;
 
+// Сколько раз игра зовёт каждый наш перехват. Подбор идёт ровно с той
+// частотой, с какой срабатывает перехват, из которого зовётся drain_pending,
+// поэтому эти три числа прямо объясняют "собирает пачками".
+static volatile LONG g_hitArea, g_hitOwn, g_hitEnq;
+// Такты автосбора и реально отправленные действия за тот же срок:
+// без них не отличить "обходим редко" от "обходим часто, а брать нечего".
+static volatile LONG g_hitTick, g_hitSent, g_hitCand;
+
 static bool read_u32(const void *p, uint32_t *out) {
     if (!readable(p, 4)) return false;
     __try { *out = *(const uint32_t *)p; return true; }
@@ -234,6 +242,74 @@ static void *rip_target(unsigned char *insn, int dispOff, int insnLen) {
     return insn + insnLen + rel;
 }
 
+// Третий аргумент зарядки. Разбор трёх настоящих мест вызова в игре показал,
+// что аргументов у функции ТРИ, а не четыре: r9 никто не заполняет, и всё,
+// что мод видел там раньше, было мусором от предыдущего вызова. А r8 - вовсе
+// не рабочая область, куда можно подсунуть обнулённый буфер: это готовый
+// объект-параметр, и два места вызова из трёх подставляют туда один и тот же
+// глобал игры. Мод передавал вместо него нули, функция честно отрабатывала
+// вхолостую, узел оставался пустым - отсюда и "без изменений" на каждой жиле.
+static void *g_armArg3;
+
+// Глобал из места вызова оказался лишь одним из двух вариантов параметра, и
+// в покое он нулевой: функция по нему уходит в ветку "список по умолчанию" и
+// узел не наполняет. Настоящие вызовы игры несут заполненный блок, одинаковый
+// для всех узлов - и для жилы, и для травы, и для клиентского компонента, и
+// для серверного, - а внутри у него указатель в саму игру, не на стек.
+// Поэтому блок не собирается по кусочкам, а СНИМАЕТСЯ с первого же вызова
+// игры и повторяется байт в байт. Так мод не гадает, что там за поля.
+static __declspec(align(16)) unsigned char g_armParam[192];
+static volatile LONG g_armParamOk;
+
+// Настоящая зарядка найдена и разобрана. Цепочка такая:
+//   диспетчер +0x205D070 (это переехавшая старая "зарядка узла")
+//     -> виртуальный метод компонента +0x838
+//        -> помощник, который делает lea rdi,[rcx+0xE0] - поле сбора - и
+//           дописывает туда запись в 0x28 байт.
+// Из третьего аргумента помощник читает ТОЛЬКО первый dword (mov eax,[rdx]):
+// это идентификатор добычи, по нему он ищет запись в списке и, не найдя,
+// добавляет новую. Всё остальное содержимое блока не читается никем.
+//
+// Отсюда два вывода. Первый: снимать у игры весь блок с его указателями на
+// живую память было незачем и опасно - хватает одного числа. Второй: число
+// это всё равно не зашивается в мод, а берётся из настоящего вызова игры,
+// иначе следующий патч молча всё сломает.
+static volatile LONG g_armGatherId;   // идентификатор добычи, снятый с игры
+static int  g_armSlot;                // смещение метода в таблице компонента
+
+// В снятом блоке не только статики игры: три поля указывают на живую память
+// рядом с кадром вызова. Повторять их как есть нельзя - к нашему вызову они
+// протухнут, и функция будет читать и ПИСАТЬ в чужое. Поэтому вместе с блоком
+// снимается и та область, куда он смотрит, а указатели переставляются на нашу
+// копию. Тогда чтение получает то же, что видела игра, а любая запись уходит
+// в наши байты и никого не задевает. Указатели внутрь модуля игры не трогаем:
+// это статика, она никуда не денется.
+static __declspec(align(16)) unsigned char g_armArena[4096];
+static size_t g_armArenaN;
+
+// Ищем объект-параметр зарядки не шаблоном, а от МЕСТА ВЫЗОВА - тем же
+// приёмом, которым выводятся tls+desc и own_check. Шаблон "lea r8,[rip+X]"
+// сам по себе встречается в игре сотнями; отбор идёт по цели вызова: годится
+// только тот, чей E8 ведёт ровно в нашу функцию зарядки. Таких мест в игре
+// одно. Сам глобал лежит в неинициализированной секции и наполняется игрой
+// при запуске, поэтому берём его адрес, а не содержимое.
+static void find_arm_default(unsigned char *armFn) {
+    unsigned char *end = g_game.base + g_game.size - 17;
+    for (unsigned char *cur = g_game.base; cur < end; cur++) {
+        if (cur[0] != 0x4C || cur[1] != 0x8D || cur[2] != 0x05) continue;
+        if (cur[7] != 0x33 || cur[8] != 0xD2) continue;   // xor edx,edx - режим 0
+        if (cur[9] != 0x48 || cur[10] != 0x8B) continue;  // mov rcx,<reg>
+        if (cur[12] != 0xE8) continue;
+        if (cur + 17 + *(int32_t *)(cur + 13) != armFn) continue;
+        g_armArg3 = cur + 7 + *(int32_t *)(cur + 3);
+        L("[зарядка] объект-параметр = +0x%llX (место вызова +0x%llX)",
+          (unsigned long long)((unsigned char *)g_armArg3 - g_game.base),
+          (unsigned long long)(cur - g_game.base));
+        return;
+    }
+    L("[зарядка] объект-параметр НЕ НАЙДЕН - сам звать не буду");
+}
+
 static bool resolve_functions() {
     // tls+desc больше НЕ ищется своим шаблоном. Он был самым длинным и хрупким
     // в моде: захватывал тело функции целиком плюс начало следующей, и на
@@ -254,8 +330,14 @@ static bool resolve_functions() {
         "48 89 5C 24 08 57 48 83 EC 20 48 8B ?? 38 65 48 8B 04 25 58 00 00 00");
     // Сигнатура попадает на 0xF байт внутрь тела функции - её начало лежит
     // раньше. Проверяем, что там действительно пролог, а не случайные байты.
+    // Пролог и кадр (sub rsp,50; vmovaps [rsp+40],xmm6) не менялись, а вот
+    // раскладка регистров после них - да. До 2658 шло
+    //     4D 8B ?? 44 8B ?? 48 8B ??
+    // на 2760 (2.01.00) компилятор выдал
+    //     4C 8B FA 48 8B F1 48 8B 3A 44 8B 77 18   (r15=rdx, rsi=rcx, rdi=[rdx], r14d=[rdi+18])
+    // Контекст тот же: счётчик по +0x108, массив сущностей по +0x110.
     unsigned char *areaHit = aob("area_sweep",
-        "55 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 50 C5 F8 29 74 24 40 4D 8B ?? 44 8B ?? 48 8B ??");
+        "55 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 50 C5 F8 29 74 24 40 4C 8B ?? 48 8B ?? 48 8B ?? 44 8B");
     if (areaHit) {
         unsigned char *start = areaHit - 0x0F;
         L("[aob] area_sweep начало = +0x%llX (байты %02X %02X %02X)",
@@ -317,6 +399,135 @@ static bool resolve_functions() {
               g_fn.descMask && g_fn.queue;
     L("[aob] итог: %s", ok ? "ключевые функции найдены" : "часть не найдена");
     return ok;
+}
+
+// ------------------------------------------------ менеджер акторов ----------
+// Контекст обхода раньше брался ТОЛЬКО из аргумента перехваченной функции, и
+// это оказалось самым хрупким местом мода. На 2.01.00 сигнатура обхода сошлась
+// с ЧУЖОЙ функцией: перехват встал, вызовы шли, а в rcx лежал посторонний
+// объект. Игрок в нём не находился, обход выходил на полпути, и мод молча не
+// собирал ничего - при том, что в логе все восемь сигнатур были "уникально".
+//
+// Менеджер акторов в процессе ровно один, и указатель на него лежит в глобале
+// образа. Ищем его по ИМЕНИ КЛАССА: имена в RTTI - символы из исходников игры,
+// они переживают патчи, в отличие от адресов и байтовых шаблонов.
+//
+//     ".?AVClientActorManager@pa@@" -> TypeDescriptor -> COL -> таблица
+//     методов -> глобал, в котором лежит объект с этой таблицей
+//
+// Список сущностей у менеджера лежит по +0x190 обычной тройкой
+// {штук, мест, массив} - её находит тот же перебор 0x100..0x200, что и раньше.
+static void **g_mgrSlot;        // глобал образа с указателем на менеджера
+
+// Таблицы методов менеджера. Ищутся один раз: имя класса и RTTI в образе
+// лежат неподвижно, а вот сам объект появляется позже.
+static unsigned char *g_mgrVt[4];
+static int  g_mgrVtN;
+static bool g_mgrVtDone;
+
+static void find_actor_manager_vtables(void) {
+    if (g_mgrVtDone) return;
+    g_mgrVtDone = true;
+    static const char NAME[] = ".?AVClientActorManager@pa@@";
+    const int nlen = (int)sizeof NAME;               // вместе с нулём
+    unsigned char *lim = g_game.base + g_game.size;
+
+    unsigned char *td = 0;
+    for (unsigned char *p = g_game.base; p + nlen < lim; p++) {
+        if (*p != '.' || memcmp(p, NAME, nlen) != 0) continue;
+        td = p - 0x10;                               // имя лежит по td+0x10
+        break;
+    }
+    if (!td) { L("[менеджер] класс ClientActorManager в образе не найден"); return; }
+    uint32_t tdRva = (uint32_t)(td - g_game.base);
+
+    // COL (_R4): сигнатура 1 по +0x00 и ссылка на дескриптор по +0x0C.
+    for (unsigned char *p = g_game.base; p + 0x18 < lim && g_mgrVtN < 4; p += 4) {
+        if (*(uint32_t *)(p + 0x0C) != tdRva || *(uint32_t *)p != 1) continue;
+        uint64_t colVa = (uint64_t)(uintptr_t)p;
+        for (unsigned char *q = g_game.base; q + 16 < lim; q += 8) {
+            if (*(uint64_t *)q != colVa) continue;
+            g_mgrVt[g_mgrVtN++] = q + 8;             // таблица идёт сразу за COL
+            break;
+        }
+    }
+    L("[менеджер] класс найден, таблиц методов: %d (первая +0x%llX)", g_mgrVtN,
+      g_mgrVtN ? (unsigned long long)(g_mgrVt[0] - g_game.base) : 0ull);
+}
+
+// Глобал с указателем на менеджера. Ищем ТОЛЬКО по записываемым секциям без
+// кода: глобалы игры лежат в .srdata (8 МБ), а не в .debug$P на четверть
+// гигабайта - с ним перебор стоил бы секунду вместо сотой доли.
+static void **find_actor_manager_slot(void) {
+    find_actor_manager_vtables();
+    if (!g_mgrVtN) return 0;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)g_game.base;
+    IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(g_game.base + dos->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    long cand = 0, live = 0, sects = 0;
+    for (int si = 0; si < nt->FileHeader.NumberOfSections; si++) {
+        DWORD ch = sec[si].Characteristics;
+        if (!(ch & IMAGE_SCN_MEM_WRITE) || (ch & IMAGE_SCN_MEM_EXECUTE)) continue;
+        unsigned char *b = g_game.base + sec[si].VirtualAddress;
+        unsigned char *e = b + sec[si].Misc.VirtualSize;
+        if (e > g_game.base + g_game.size) e = g_game.base + g_game.size;
+        sects++;
+        // По секции идём кусками, которые система считает отданными: у
+        // .srdata хвост за пределами файла, и упереться в незанятую страницу
+        // здесь означает исключение прямо посреди перебора.
+        for (unsigned char *rp = b; rp < e; ) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(rp, &mbi, sizeof mbi)) break;
+        unsigned char *rEnd = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
+        if (rEnd > e) rEnd = e;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) { rp = rEnd; continue; }
+        for (unsigned char *p = rp; p + 8 <= rEnd; p += 8) {
+            uint64_t v = *(uint64_t *)p;
+            if (v < 0x10000 || (v >> 47)) continue;
+            if (in_image((void *)(uintptr_t)v)) continue;
+            cand++;
+            // readable() здесь стоял зря и был дорог: указателей в .srdata
+            // сто сорок тысяч, а одна проверка памяти в этом процессе - 300
+            // мкс, то есть сорок секунд на перебор. Чтение и так укрыто
+            // перехватом исключения, оно и решает.
+            uint64_t head = 0;
+            __try { head = *(uint64_t *)(uintptr_t)v; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+            live++;
+            for (int i = 0; i < g_mgrVtN; i++) {
+                if (head != (uint64_t)(uintptr_t)g_mgrVt[i]) continue;
+                L("[менеджер] найден: глобал +0x%llX -> %p",
+                  (unsigned long long)(p - g_game.base), (void *)(uintptr_t)v);
+                return (void **)p;
+            }
+        }
+        rp = rEnd;
+        }
+    }
+    // Один раз рассказываем, почему не нашли: секций столько-то, указателей
+    // столько-то. Пусто в этих числах - значит ищем не там, а не "объекта нет".
+    static LONG told = 0;
+    if (InterlockedExchange(&told, 1) == 0)
+        L("[менеджер] пока не найден: секций %ld, указателей %ld, прочиталось %ld",
+          sects, cand, live);
+    return 0;
+}
+
+// Менеджера при старте игры ЕЩЁ НЕТ: мод поднимается за секунду, а мир
+// создаётся позже. Поэтому ищем не один раз на старте, а повторяем, пока не
+// найдём. Перебор идёт по восьми мегабайтам .srdata и стоит недорого.
+static void *actor_manager(void) {
+    if (!g_mgrSlot) {
+        static DWORD nextTry = 0;
+        DWORD now = GetTickCount();
+        if (nextTry && (LONG)(now - nextTry) < 0) return 0;
+        nextTry = now + 3000;
+        g_mgrSlot = find_actor_manager_slot();
+        if (!g_mgrSlot) return 0;
+    }
+    void *p = 0;
+    __try { p = *g_mgrSlot; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return readable(p, 0x200) ? p : 0;
 }
 
 // ------------------------------------------------------ раскладка сущности --
@@ -620,9 +831,16 @@ static void hud_set(const char *fmt, ...) {
 }
 
 static LRESULT CALLBACK hud_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_ERASEBKGND) return 1;      // фон не трогаем - рисуем сами
     if (msg != WM_PAINT) return DefWindowProcW(h, msg, wp, lp);
-    PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+    PAINTSTRUCT ps; HDC front = BeginPaint(h, &ps);
     RECT full; GetClientRect(h, &full);
+    // Всё рисуется на теневом холсте и переносится на экран одним движением.
+    // Без этого каждая перерисовка сначала показывала пустой чёрный кадр, и
+    // при частых обновлениях панель мигала, а счётчик предметов "пропадал".
+    HDC dc = CreateCompatibleDC(front);
+    HBITMAP bm = CreateCompatibleBitmap(front, full.right, full.bottom);
+    HGDIOBJ oldBm = SelectObject(dc, bm);
     HBRUSH clear = CreateSolidBrush(RGB(0, 0, 0));   // прозрачный цвет
     FillRect(dc, &full, clear); DeleteObject(clear);
 
@@ -700,6 +918,8 @@ static LRESULT CALLBACK hud_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         DrawTextW(dc, w, -1, &tr, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
     }
     SelectObject(dc, old); DeleteObject(f);
+    BitBlt(front, 0, 0, full.right, full.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldBm); DeleteObject(bm); DeleteDC(dc);
     EndPaint(h, &ps);
     return 0;
 }
@@ -737,7 +957,7 @@ static DWORD WINAPI hud_thread(LPVOID) {
             lastSeq = -1;
         }
         LONG seq = InterlockedCompareExchange(&g_hudSeq, 0, 0);
-        if (want && seq != lastSeq) { InvalidateRect(g_hudWnd, 0, TRUE); lastSeq = seq; }
+        if (want && seq != lastSeq) { InvalidateRect(g_hudWnd, 0, FALSE); lastSeq = seq; }
         Sleep(100);
     }
     DestroyWindow(g_hudWnd); g_hudWnd = 0;
@@ -973,7 +1193,7 @@ struct PendAct { int act; uint32_t eid, player, route; uint8_t mode; };
 static PendAct       g_pendAct[64];
 static int           g_pendActN;
 
-struct PendArm { void *node; uintptr_t mode; uint32_t player, eid; };
+struct PendArm { void *node; uintptr_t mode; uint32_t player, eid; int var; };
 static PendArm       g_pendArm[32];
 static int           g_pendArmN;
 
@@ -1017,6 +1237,7 @@ static bool send_action(Action act, uint32_t targetEid, uint32_t playerEid,
         InterlockedExchange(&g_sendTid, (LONG)GetCurrentThreadId());
         ((FnEnqueue)g_fn.enqueue)(q, ev, desc, 0);
         InterlockedExchange(&g_sendTid, 0);
+        InterlockedIncrement(&g_hitSent);
         L("[send] ОТПРАВЛЕНО в очередь %p", q);
         ok = true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1195,6 +1416,7 @@ static const char *desc_name(void *d) {
 }
 
 extern "C" void __fastcall cdloot_on_enqueue(void *q, void *ev, void *desc, void *z) {
+    InterlockedIncrement(&g_hitEnq);
     (void)q; (void)z;
     // Сначала route: он нужен всегда, а не только во время записи.
     if (!InterlockedCompareExchange(&g_routeKnown, 0, 0)) {
@@ -1308,11 +1530,38 @@ static volatile LONG g_aimIdxEid;   // на что смотрит игрок
 static char g_aimText[128];
 static unsigned char *g_armFn;      // сама функция зарядки, найденная по сигнатуре
 static volatile LONG  g_armMode;    // режим из подсмотренного вызова
-typedef void (*FnArm)(void *, uintptr_t, void *, uintptr_t);
+typedef void (*FnArm)(void *, uintptr_t, void *);
+
+
+// Сигнатура может совпасть не с той функцией. Так и вышло на игре 1.0.0.2760:
+// шаблон нашёл похожий пролог, мод исправно звал найденное, вызов возвращался
+// без ошибки и без всякого действия - а каждая рудная жила после этого уходила
+// в чёрный список как "не поддаётся зарядке". Совпадение шаблона - не проверка.
+//
+// Проверка одна: на функцию стоит наш хук, и если это действительно зарядка,
+// игра зовёт её сама, стоит подойти к любому кусту. Пока мы этого не увидели,
+// звать её нельзя - неизвестно, что там и с какими аргументами. Свои вызовы в
+// зачёт не идут, иначе мод подтвердит сам себя.
+static volatile LONG g_armSeen;     // игра позвала функцию столько раз
+static volatile LONG g_armSelf;     // сейчас внутри НАШЕГО вызова
+static volatile LONG g_armToldNo;   // про неподтверждённую сказали в лог
+
+// Заряжать можно, когда есть и метод, и снятый с игры идентификатор добычи.
+// Идентификатор появляется с первого же вызова игры - достаточно подойти к
+// любому узлу. Пока его нет, мод молча ждёт, а не зовёт наугад.
+static bool arm_usable() {
+    if (!g_armSlot) return false;
+    if (InterlockedCompareExchange(&g_armGatherId, 0, 0) == 0) {
+        if (!InterlockedExchange(&g_armToldNo, 1))
+            L("[зарядка] идентификатор добычи ещё не снят - жду вызова игры");
+        return false;
+    }
+    return true;
+}
 
 // Вызов зарядки вынесен в отдельную функцию: в area_body есть объекты с
 // деструктором (секундомер), а __try с ними в одном теле не уживается.
-static bool arm_call_now(void *inter, uintptr_t mode, void *scratch, uintptr_t eid);
+static bool arm_call_now(void *inter, uintptr_t mode);
 
 // Возвращает: 1 - вызвали прямо сейчас, 2 - поставили в очередь (исполнит
 // хук в ближайшем кадре), 0 - исключение внутри вызова.
@@ -1320,27 +1569,99 @@ static bool arm_call_now(void *inter, uintptr_t mode, void *scratch, uintptr_t e
 // бессмысленно - данные узла ещё не появились. Раньше этого различия не было,
 // и после переноса обхода в свой поток мод видел "без изменений" и заносил
 // рудные жилы в чёрный список навсегда. Руда перестала собираться.
-static int arm_call(void *inter, uintptr_t mode, void *scratch, uintptr_t eid) {
+static int arm_call(void *inter, uintptr_t mode, uintptr_t eid) {
     if (!on_game_thread()) {
         pend_init();
         EnterCriticalSection(&g_pendCs);
         bool room = g_pendArmN < 32;
         if (room) {
             PendArm &q = g_pendArm[g_pendArmN++];
-            q.node = inter; q.mode = mode; q.player = (uint32_t)eid;
+            q.node = inter; q.mode = mode; q.player = (uint32_t)eid; q.var = -1;
             q.eid = InterlockedCompareExchange(&g_armLastEid, 0, 0);
         }
         LeaveCriticalSection(&g_pendCs);
         return room ? 2 : 0;         // 2 - отложено, исполнит хук
     }
-    return arm_call_now(inter, mode, scratch, eid) ? 1 : 0;
+    return arm_call_now(inter, mode) ? 1 : 0;
 }
 
-static bool arm_call_now(void *inter, uintptr_t mode, void *scratch, uintptr_t eid) {
+// ---------------------------------------------------- варианты зарядки ------
+// Найденная сигнатурой функция узел не наполняет, и разбор образа показал
+// почему это может быть: она не лежит в цепочке, которая на самом деле пишет
+// в узел, и её нет в таблице методов гиммик-компонента. Гадать дальше в
+// одиночку дорого, поэтому вариантов сделано несколько и они перебираются
+// клавишей: каждое нажатие пробует следующий и печатает, изменился ли узел.
+#define ARM_VARIANTS 6
+static volatile LONG g_armVar;
+static volatile LONG g_armVarReq;
+static const char *arm_var_name(int v) {
+    switch (v) {
+    case 0: return "найденная функция, режим 0, снятый параметр";
+    case 1: return "найденная функция, режим 1, снятый параметр";
+    case 2: return "найденная функция, режим 0, глобал из места вызова";
+    case 3: return "виртуальный метод компонента +0x830";
+    case 4: return "виртуальный метод компонента +0x838";
+    default: return "виртуальный метод компонента +0x828";
+    }
+}
+
+// Вызов варианта. Всё под перехватом исключений: половина вариантов - заведомо
+// пробные, и промах здесь штатное дело, а не повод ронять игру.
+static bool arm_call_variant(void *inter, int var) {
+    typedef void (*Fn3)(void *, uintptr_t, void *);
     __try {
-        ((FnArm)g_armFn)(inter, mode, scratch, eid);
+        void *param = (var == 2) ? g_armArg3 : (void *)g_armParam;
+        if (var <= 2) {
+            if (!g_armFn || !param) return false;
+            ((Fn3)g_armFn)(inter, var == 1 ? 1 : 0, param);
+            return true;
+        }
+        int slot = (var == 3) ? 0x830 : (var == 4) ? 0x838 : 0x828;
+        void **vt = *(void ***)inter;
+        if (!readable(vt, slot + 8)) return false;
+        void *fn = vt[slot / 8];
+        if (!fn || !readable(fn, 8)) return false;
+        ((Fn3)fn)(inter, 0, (void *)g_armParam);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Вариант всегда исполняется игровым потоком: пробный вызов чужой функции с
+// нашего потока - лишний способ уронить игру.
+static void arm_queue_var(void *inter, int var, uint32_t eid) {
+    pend_init();
+    EnterCriticalSection(&g_pendCs);
+    if (g_pendArmN < 32) {
+        PendArm &q = g_pendArm[g_pendArmN++];
+        q.node = inter; q.mode = 0; q.player = 0; q.eid = eid; q.var = var;
+    }
+    LeaveCriticalSection(&g_pendCs);
+}
+
+static bool arm_call_now(void *inter, uintptr_t mode) {
+    (void)mode;
+    LONG gid = InterlockedCompareExchange(&g_armGatherId, 0, 0);
+    if (!g_armSlot || !gid) return false;
+    // Четвёртым идёт идентификатор, по которому метод лезет в таблицу игры.
+    // Заведомо несуществующий - и он выходит сразу после того, как список уже
+    // наполнен. Ноль вместо него уводит в другую ветку, где метод дописывает
+    // ещё и во вложенный список; трогать лишнее в чужих структурах незачем.
+    typedef void (*FnArm4)(void *, uintptr_t, void *, uintptr_t);
+    InterlockedIncrement(&g_armSelf);
+    __try {
+        __declspec(align(16)) uint32_t blk[16] = { 0 };
+        blk[0] = (uint32_t)gid;
+        void **vt = *(void ***)inter;
+        if (!readable(vt, g_armSlot + 8)) { InterlockedDecrement(&g_armSelf); return false; }
+        void *fn = vt[g_armSlot / 8];
+        if (!fn || !readable(fn, 8)) { InterlockedDecrement(&g_armSelf); return false; }
+        ((FnArm4)fn)(inter, 0, blk, 0xFFFFFFFF);
+        InterlockedDecrement(&g_armSelf);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedDecrement(&g_armSelf);
+        return false;
+    }
 }
 
 static volatile LONG g_scanRequested;
@@ -1375,6 +1696,12 @@ static void notice(const char *text, UINT beep) {
     g_notice[sizeof g_notice - 1] = 0;
     g_noticeUntil = GetTickCount() + 2000;
     if (g_notifyOn) {
+        // Текст кладём на плашку СРАЗУ. Раньше его писал только обход сцены,
+        // а тот доходит до конца не всегда: не нашёлся игрок в контексте -
+        // и обход выходит на полпути. Окно при этом показывалось, но со
+        // старой строкой: обычно с той самой "CDLoot ready" от загрузки.
+        // Со стороны выглядело так, будто F10 и F11 ничего не делают.
+        hud_set("%s", g_notice);
         InterlockedExchange(&g_hudOn, 1);          // табличку показать
         MessageBeep(beep);
     }
@@ -2286,6 +2613,22 @@ static void arm_mark(uint64_t key, DWORD now) {
     g_armed[k] = key; g_armedAt[k] = now; g_armedN++;
 }
 
+// Узел, не ответивший на зарядку, раньше уходил в чёрный список с первого
+// раза. Это неверно даже при исправной сигнатуре: игра наполняет узел не
+// мгновенно, и первая попытка часто приходит в ещё пустой. Считаем отказы и
+// сдаёмся только после трёх подряд.
+#define ARM_BAD_SLOTS 128
+static uint64_t g_armBad[ARM_BAD_SLOTS];
+static uint8_t  g_armBadN_[ARM_BAD_SLOTS];
+static int      g_armBadPos;
+static int arm_fail(uint64_t key) {
+    for (int i = 0; i < ARM_BAD_SLOTS; i++)
+        if (g_armBad[i] == key) return ++g_armBadN_[i];
+    int k = g_armBadPos++ & (ARM_BAD_SLOTS - 1);
+    g_armBad[k] = key; g_armBadN_[k] = 1;
+    return 1;
+}
+
 static void mark_done(uint64_t key, DWORD now) {
     // Уже пробовали? Считаем попытки. Три подряд по одному и тому же объекту
     // означают, что он от нашего события не исчезает - брать его нечем.
@@ -2984,9 +3327,15 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
     if (hudTick) lastHud = now;
     LONG dumpEid = InterlockedCompareExchange(&g_dumpEid, 0, 0);
     if (!scanReq && !autoTick && !hudTick && !dumpEid) return;
+    if (autoTick) InterlockedIncrement(&g_hitTick);
     TickTimer tt(verbose ? "обзор F9" : (autoTick ? "автосбор" : "плашка"));
     LARGE_INTEGER ph0, ph1, ph2, ph3;
     QueryPerformanceCounter(&ph0);
+    // Контекст берём у менеджера акторов, а аргумент перехвата оставляем
+    // запасным путём: он верен ровно до тех пор, пока сигнатура обхода
+    // указывает на ту функцию, на которую мы думаем.
+    void *mgrCtx = actor_manager();
+    if (mgrCtx) ctx = mgrCtx;
     if (!ctx || !readable(ctx, 0x200)) { if (verbose) L("[scan] контекст нечитаем"); return; }
     unsigned char *c = (unsigned char *)ctx;
 
@@ -3122,7 +3471,41 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
     bool settling = now < holdUntil;
 
     QueryPerformanceCounter(&ph1);
-    if (!me) { if (verbose) L("[игрок] сущности с меткой 0xA0 в контексте нет"); return; }
+    if (!me) {
+        if (verbose) {
+            L("[игрок] сущности с меткой 0xA0 в контексте нет");
+            // Разведка на случай "игрока нет". Причин всего две, и различаются
+            // они одним взглядом: либо мы перехватили ЧУЖУЮ функцию и в rcx
+            // лежит посторонний объект, либо функция та, а смещение метки
+            // внутри сущности уехало. Имя класса из RTTI - символ из исходников
+            // игры, он между версиями не меняется, поэтому по нему видно сразу,
+            // акторы ли лежат в массиве.
+            L("[разведка] контекст %p, его класс %s",
+              c, rtti_short(c) ? rtti_short(c) : "имени нет");
+            for (int off = 0x100; off + 16 <= 0x200; off += 8) {
+                uint32_t count, cap; uint64_t data;
+                if (!read_u32(c + off, &count) || !read_u32(c + off + 4, &cap) ||
+                    !read_u64(c + off + 8, &data)) continue;
+                if (!count || !cap || count > cap || cap > 0x10000) continue;
+                if (!readable((void *)data, 8)) continue;
+                L("[разведка] +0x%03X: штук=%u мест=%u массив=%p",
+                  off, count, cap, (void *)data);
+                unsigned char **arr = (unsigned char **)data;
+                for (uint32_t i = 0; i < count && i < 6; i++) {
+                    uint64_t ep;
+                    if (!read_u64(arr + i, &ep)) break;
+                    unsigned char *e = (unsigned char *)ep;
+                    if (!readable(e, 0x100)) { L("[разведка]    [%u] %p - не читается", i, e); continue; }
+                    const char *cls = rtti_short(e);
+                    uint32_t a60 = 0, a58 = 0, a64 = 0;
+                    read_u32(e + 0x58, &a58); read_u32(e + 0x60, &a60); read_u32(e + 0x64, &a64);
+                    L("[разведка]    [%u] %p класс=%s +0x58=%08X +0x60=%08X +0x64=%08X",
+                      i, e, cls ? cls : "?", a58, a60, a64);
+                }
+            }
+        }
+        return;
+    }
     if (verbose) {
         L("[игрок] eid=%08X route=%08X тип=%02X  %s(%.1f, %.1f, %.1f)",
           playerEid, playerRoute, ent_type(me), haveMe ? "позиция " : "ПОЗИЦИИ НЕТ ", mp.x, mp.y, mp.z);
@@ -3345,6 +3728,9 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
     LONG armAim = InterlockedExchange(&g_armAimReq, 0);
     if (InterlockedExchange(&g_armReq, 0) || armAim) {
         if (!g_armFn) L("[зарядка] функция не найдена, звать нечего");
+        else if (InterlockedCompareExchange(&g_armSeen, 0, 0) == 0)
+            L("[зарядка] ВНИМАНИЕ: функция не подтверждена, игра её ни разу"
+              " не звала. Ручной вызов - это опыт, может уронить игру");
         else {
             void *inter2 = 0; uint32_t aeid = 0; float ad = 0;
             // Numpad1 - зарядить ИМЕННО то, на что смотришь. Ближайший узел
@@ -3375,7 +3761,16 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
                 LONG mode = InterlockedCompareExchange(&g_armMode, 0, 0);
                 L("[зарядка] зову для eid=%08X (%.1f м), узел=%p, режим=%ld, игрок=%08X",
                   aeid, ad, inter2, mode, playerEid);
-                int r = arm_call(inter2, (uintptr_t)mode, scratch, (uintptr_t)playerEid);
+                LONG useVar = InterlockedExchange(&g_armVarReq, 0);
+                if (useVar) {
+                    int var = (int)InterlockedCompareExchange(&g_armVar, 0, 0);
+                    L("[зарядка] пробую вариант %d из %d: %s",
+                      var, ARM_VARIANTS, arm_var_name(var));
+                    arm_queue_var(inter2, var, aeid);
+                    InterlockedExchange(&g_armVar, (var + 1) % ARM_VARIANTS);
+                }
+                else {
+                int r = arm_call(inter2, (uintptr_t)mode, (uintptr_t)playerEid);
                 if (r == 2) {
                     L("[зарядка] поставлена в очередь - исполнит игровой поток");
                 } else if (r == 1) {
@@ -3384,6 +3779,7 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
                       before, after, (before != after) ? "  <- ЗАРЯДИЛОСЬ" : "");
                 } else {
                     L("[зарядка] исключение внутри вызова - так звать нельзя");
+                }
                 }
             }
         }
@@ -3475,11 +3871,32 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
         // у объекта framework по +0x50 лежит камера. Значит ищем не адрес, а
         // структуру: пробегаем область глобалов и проверяем каждого кандидата
         // по имени класса через RTTI. Узкий поиск, без блужданий по памяти.
+        // Проверка "глобал не пуст" оказалась недостаточной. На 1.0.0.2760
+        // по этому адресу лежит посторонняя величина (в логе она видна как
+        // framework = 103E046E0E44002E - это не указатель), поиск по форме не
+        // включался, камера не находилась, и метки не рисовались вовсе, хотя
+        // перекрестье на экране было. Поэтому глобал считается годным только
+        // если по нему действительно лежит объект с камерой по +0x50.
         unsigned char *fwp = g_game.base + 0x6330C80;
-        if (!readable(fwp, 8) || !*(void **)fwp) {
-            L("[камера] глобал ESP пуст - ищу framework по форме в области глобалов");
+        bool fwOk = false;
+        if (readable(fwp, 8)) {
+            unsigned char *fw0 = *(unsigned char **)fwp;
+            if (fw0 && readable(fw0, 0x60)) {
+                unsigned char *c0 = *(unsigned char **)(fw0 + 0x50);
+                if (c0 && readable(c0, 8)) {
+                    const char *cl0 = safe_class(c0);
+                    fwOk = cl0 && stristr_ru(cl0, "camera");
+                }
+            }
+        }
+        if (!fwOk) {
+            L("[камера] глобал ESP не годен - ищу framework по форме в области глобалов");
+            // Область глобалов на 1.0.0.2760 уехала выше: менеджер акторов
+            // лежит по +0x6C29FC8, а прежний диапазон до +0x6800000 его уже не
+            // покрывал - "по форме ничего не нашлось" при живой камере.
+            // Берём всю область данных образа, до начала отладочной секции.
             unsigned char *from = g_game.base + 0x6000000;
-            unsigned char *to   = g_game.base + 0x6800000;
+            unsigned char *to   = g_game.base + 0x7400000;
             if (to > g_game.base + g_game.size) to = g_game.base + g_game.size - 8;
             int found = 0;
             for (unsigned char *q = from; q < to && found < 6; q += 8) {
@@ -4208,6 +4625,7 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
             L("[scan] промахов чтения: %ld (это норма, если немного: массив живой)", f);
             toldFaults = f;
         }
+        if (autoTick) InterlockedExchangeAdd(&g_hitCand, (LONG)nn);
         if (m1 + m2 + m3 >= 8.0)
             L("[время] фазы: поиск игрока %.1f | список %.1f | подробности+плашка %.1f мс (объектов %d)",
               m1, m2, m3, nn);
@@ -4558,7 +4976,7 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
         // именно так. Даём игре один такт на заполнение.
         uint32_t armedNow[32]; int armedNowN = 0;
         int armed2 = 0;
-        if (g_cfg.autoArm && g_armFn) {
+        if (g_cfg.autoArm && arm_usable()) {
             for (int i = 0; i < nn; i++) {
                 Cand &k = list[i];
                 if (k.item || k.gather || !k.inter) continue;
@@ -4581,7 +4999,7 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
                 arm_mark(key, now);
                 InterlockedExchange(&g_armLastEid, (LONG)k.eid);
                 int ok = arm_call(g2, (uintptr_t)InterlockedCompareExchange(&g_armMode, 0, 0),
-                                  scratch, (uintptr_t)playerEid);
+                                  (uintptr_t)playerEid);
                 void *after = deref(g2, INTER_GATHER);
                 L("[зарядка] авто: eid=%08X %.1f м -> %s", k.eid, k.d,
                   ok == 0 ? "исключение" :
@@ -4595,10 +5013,10 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
                 // сундук и шкаф в комнате по кругу.
                 // Судим только по НАСТОЯЩЕМУ вызову. Отложенный (ok == 2)
                 // ещё не выполнен, и его пустой результат ничего не значит.
-                if (ok == 1 && !after) {
+                if (ok == 1 && !after && arm_fail(key) >= 3) {
                     mark_searched(key);
-                    L("[зарядка] eid=%08X не поддаётся зарядке - это не добыча,"
-                      " больше не трогаю", k.eid);
+                    L("[зарядка] eid=%08X не ответил на зарядку трижды -"
+                      " это не добыча, больше не трогаю", k.eid);
                 }
                 fill_details_again(k);       // данные узла только что появились
                 if (armedNowN < 32) armedNow[armedNowN++] = k.eid;
@@ -4645,8 +5063,15 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
             if (already_searched(key)) continue;
             dup_watch(now, list[i].eid, list[i].parent, list[i].tid, list[i].cat2,
                       (uint8_t)act, list[i].d, list[i].name);
-            L("[авто] %s eid=%08X d=%.1f м тип=%u вид=%02X %s", act_name(act),
+            // РОДИТЕЛЬ пишется теперь всегда. Проверка родителя отсекает только
+            // СВОЁ (parent == игрок), а вещь, подвешенная к сундуку, ящику или
+            // чужому актору, её проходит. Если в этом поле окажется не ноль -
+            // мод берёт содержимое чужой ёмкости или снаряжение чужого актора,
+            // и лишние предметы у игрока берутся именно оттуда.
+            L("[авто] %s eid=%08X d=%.1f м тип=%u вид=%02X род=%08X кат=0x%02X к2=0x%02X %s",
+              act_name(act),
               list[i].eid, list[i].d, list[i].tid, list[i].gkind,
+              list[i].parent, list[i].cat, list[i].cat2,
               list[i].name ? list[i].name
                            : (list[i].nodeName ? list[i].nodeName : "без имени"));
             if (act == ACT_SEARCH) mark_searched(cand_key(list[i].eid, list[i].iid));
@@ -4698,7 +5123,15 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
 // похода в ядро, поэтому промах по указателю здесь - штатная ситуация:
 // такт пропускается, игра продолжает работать.
 // Исполнение отложенных решений - строго на игровом потоке.
+static volatile LONG g_draining;
+
+static void arm_rec_check();     // разбор прицельной записи, тело ниже
+
 static void drain_pending(void) {
+    // Слив зовётся теперь из двух мест, и оба - игровой поток. Второго
+    // захода внутрь себя не допускаем: отправка события снова проходит через
+    // очередь игры, а та - через наш же перехват.
+    if (InterlockedCompareExchange(&g_draining, 1, 0) != 0) return;
     // Забираем ОБЕ очереди под замком и сразу освобождаем его: отправка зовёт
     // функции игры и может занять время, держать на ней замок незачем.
     PendArm arms[32]; int armN;
@@ -4713,12 +5146,16 @@ static void drain_pending(void) {
     g_pendActN = 0;
     LeaveCriticalSection(&g_pendCs);
 
+    arm_rec_check();
     for (int i = 0; i < armN; i++) {
         if (!arms[i].node || !readable(arms[i].node, 0x400)) continue;
         static __declspec(align(16)) unsigned char scratch[256];
         memset(scratch, 0, sizeof scratch);
         void *before = deref(arms[i].node, INTER_GATHER);
-        bool ok = arm_call_now(arms[i].node, arms[i].mode, scratch, arms[i].player);
+        bool ok = arms[i].var >= 0 ? arm_call_variant(arms[i].node, arms[i].var)
+                                   : arm_call_now(arms[i].node, arms[i].mode);
+        if (arms[i].var >= 0)
+            L("[вариант %d] %s", arms[i].var, arm_var_name(arms[i].var));
         void *after = deref(arms[i].node, INTER_GATHER);
         // Отложенная зарядка исполняется здесь, и только тут видно, сработала
         // ли она на самом деле. Без этой строки мы вслепую гадали, почему не
@@ -4730,9 +5167,11 @@ static void drain_pending(void) {
     for (int i = 0; i < actN; i++)
         send_action((Action)acts[i].act, acts[i].eid, acts[i].player,
                     acts[i].route, acts[i].mode, false);
+    InterlockedExchange(&g_draining, 0);
 }
 
 extern "C" void __fastcall cdloot_on_area(void *ctx, void *a2, void *a3, void *a4) {
+    InterlockedIncrement(&g_hitArea);
     InterlockedExchange(&g_gameTid, (LONG)GetCurrentThreadId());
     InterlockedExchangePointer((void * volatile *)&g_ctxLatest, ctx);
     __try {
@@ -4784,9 +5223,16 @@ static void own_body(void *a1, void *a2, void *a3, void *a4) {
 }
 
 extern "C" void __fastcall cdloot_on_own(void *a1, void *a2, void *a3, void *a4) {
+    InterlockedIncrement(&g_hitOwn);
+    InterlockedExchange(&g_gameTid, (LONG)GetCurrentThreadId());
     __try { own_body(a1, a2, a3, a4); } __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedExchange(&g_ownLeft, 0);
     }
+    // Слить очередь ещё и отсюда - была попытка вылечить "собирает пачками".
+    // Счётчики показали, что лечить нечего: обход зовётся ~3700 раз в секунду,
+    // и очередь уходит в игру немедленно. Отправка событий из оракула - это
+    // заход в игровой код из чужого запроса, и ради ничего его держать не
+    // стоит. Убрано намеренно, чтобы не вернули "на всякий случай".
 }
 
 // ------------------------------------------- кто заряжает узел --------------
@@ -4796,19 +5242,95 @@ extern "C" void __fastcall cdloot_on_own(void *a1, void *a2, void *a3, void *a4)
 // надо увидеть аргументы и опознать объект по имени класса.
 static volatile LONG g_armLeft;
 
-static void arm_body(void *a1, void *a2, void *a3, void *a4) {
-    if (InterlockedCompareExchange(&g_armLeft, 0, 0) <= 0) return;
-    InterlockedDecrement(&g_armLeft);
-    const char *cls = 0;
-    __try { cls = rtti_class(a1); } __except (EXCEPTION_EXECUTE_HANDLER) { }
-    InterlockedExchange(&g_armMode, (LONG)(((uintptr_t)a2) & 0xFF));
-    L("[зарядка] объект=%p (%s) режим=%d arg3=%p arg4=%u",
-      a1, cls ? cls : "имя не читается",
-      (int)(((uintptr_t)a2) & 0xFF), a3, (uint32_t)(uintptr_t)a4);
+// Прицельная запись. Просто печатать каждый вызов бесполезно: игра зовёт
+// зарядку десятками в секунду, и в этом потоке не видно, КАКОЙ из вызовов
+// наполнил узел. Поэтому запоминаем только вызовы по ещё ПУСТОМУ узлу вместе
+// с их аргументами, а через такт смотрим, у кого узел стал непустым. Тот
+// вызов и есть настоящая зарядка - с точными аргументами, которые можно
+// повторить.
+struct ArmRec { void *comp; uint32_t mode; void *param; uint32_t p0[4]; bool done; };
+static ArmRec g_armRec[64];
+static int    g_armRecN;
+static CRITICAL_SECTION g_armRecCs;
+static volatile LONG    g_armRecInit;
+
+static void arm_rec_init() {
+    if (InterlockedCompareExchange(&g_armRecInit, 1, 0) == 0)
+        InitializeCriticalSection(&g_armRecCs);
 }
 
-extern "C" void __fastcall cdloot_on_arm(void *a1, void *a2, void *a3, void *a4) {
-    __try { arm_body(a1, a2, a3, a4); }
+static void arm_body(void *a1, void *a2, void *a3) {
+    if (InterlockedCompareExchange(&g_armLeft, 0, 0) <= 0) return;
+    InterlockedExchange(&g_armMode, (LONG)(((uintptr_t)a2) & 0xFF));
+    // Интересны только вызовы по пустому узлу: у наполненного заряжать нечего.
+    void *before = 0;
+    __try { before = deref(a1, INTER_GATHER); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (before) return;
+    arm_rec_init();
+    EnterCriticalSection(&g_armRecCs);
+    if (g_armRecN < 64) {
+        ArmRec &r = g_armRec[g_armRecN++];
+        r.comp = a1; r.mode = (uint32_t)(((uintptr_t)a2) & 0xFF);
+        r.param = a3; r.done = false;
+        memset(r.p0, 0, sizeof r.p0);
+        if (readable(a3, 16)) memcpy(r.p0, a3, 16);
+    }
+    LeaveCriticalSection(&g_armRecCs);
+}
+
+// Разбор записи - на игровом потоке, через такт после самих вызовов.
+static void arm_rec_check() {
+    if (InterlockedCompareExchange(&g_armRecInit, 0, 0) == 0) return;
+    if (InterlockedCompareExchange(&g_armLeft, 0, 0) <= 0) return;
+    EnterCriticalSection(&g_armRecCs);
+    int n = g_armRecN;
+    for (int i = 0; i < n; i++) {
+        ArmRec &r = g_armRec[i];
+        if (r.done) continue;
+        void *now = 0;
+        __try { now = deref(r.comp, INTER_GATHER); } __except (EXCEPTION_EXECUTE_HANDLER) { r.done = true; continue; }
+        if (!now) continue;
+        r.done = true;
+        const char *cls = 0;
+        __try { cls = rtti_class(r.comp); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        L("[зарядка] ПОЙМАНО: узел %p (%s) наполнился. режим=%u параметр=%p%s"
+          " начало параметра: %08X %08X %08X %08X",
+          r.comp, cls ? cls : "имя не читается", r.mode, r.param,
+          r.param == g_armArg3 ? " (глобал)" : "",
+          r.p0[0], r.p0[1], r.p0[2], r.p0[3]);
+    }
+    if (g_armRecN >= 64) g_armRecN = 0;      // переполнили - начинаем заново
+    LeaveCriticalSection(&g_armRecCs);
+}
+
+extern "C" void __fastcall cdloot_on_arm(void *a1, void *a2, void *a3) {
+    // Считаем только чужие вызовы: наш собственный проходит через тот же хук.
+    // Проверка идёт ровно до первого подтверждения, дальше хук ничего не
+    // считает и не стоит ни такта. Объект обязан быть читаемым и с таблицей
+    // методов - иначе это не узел, и подтверждать нечего.
+    if (InterlockedCompareExchange(&g_armSeen, 0, 0) == 0 &&
+        InterlockedCompareExchange(&g_armSelf, 0, 0) == 0 &&
+        readable(a1, 8) && readable(*(void **)a1, 8)) {
+        InterlockedIncrement(&g_armSeen);
+        L("[зарядка] функция подтверждена: игра позвала её сама, объект=%p", a1);
+    }
+    // Снимаем образец параметра. Один раз за сессию, поэтому проверка стоит
+    // ровно ноль после первого срабатывания. Берём только режим 0 - именно им
+    // мод и заряжает, - и только с чужого вызова: свой несёт этот же образец.
+    if (InterlockedCompareExchange(&g_armParamOk, 0, 0) == 0 &&
+        InterlockedCompareExchange(&g_armSelf, 0, 0) == 0 &&
+        (((uintptr_t)a2) & 0xFF) == 0 &&
+        readable(a3, sizeof g_armParam) && *(const uint32_t *)a3) {
+        memcpy(g_armParam, a3, sizeof g_armParam);
+        InterlockedExchange(&g_armGatherId, (LONG)*(const uint32_t *)a3);
+        char hex[16 * 9 + 1]; int o = 0;
+        for (int i = 0; i < 16; i++)
+            o += sprintf(hex + o, "%08X ", ((const uint32_t *)g_armParam)[i]);
+        L("[зарядка] идентификатор добычи снят с игры: %u (0x%X). Блок: %s",
+          (unsigned)InterlockedCompareExchange(&g_armGatherId, 0, 0),
+          (unsigned)InterlockedCompareExchange(&g_armGatherId, 0, 0), hex);
+    }
+    __try { arm_body(a1, a2, a3); }
     __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedExchange(&g_armLeft, 0); }
 }
 
@@ -4958,6 +5480,35 @@ static DWORD WINAPI worker(LPVOID) {
             pF11b = f11b;
         }
 
+        // Раз в пять секунд - частота перехватов. Подбор идёт со скоростью
+        // слива, а слив живёт в перехватах, поэтому эти три числа прямо
+        // объясняют "собирает пачками".
+        if (g_debug) {
+            static DWORD lastRate = 0;
+            DWORD nowR = GetTickCount();
+            if (!lastRate) lastRate = nowR;
+            if (nowR - lastRate >= 5000) {
+                L("[частота] за %lu мс: обход %ld, оракул %ld, очередь %ld | "
+                  "тактов автосбора %ld, кандидатов %ld, отправлено %ld",
+                  (unsigned long)(nowR - lastRate),
+                  InterlockedExchange(&g_hitArea, 0),
+                  InterlockedExchange(&g_hitOwn, 0),
+                  InterlockedExchange(&g_hitEnq, 0),
+                  InterlockedExchange(&g_hitTick, 0),
+                  InterlockedExchange(&g_hitCand, 0),
+                  InterlockedExchange(&g_hitSent, 0));
+                lastRate = nowR;
+            }
+        }
+
+        // Гаснет табличка тоже здесь, а не в обходе сцены: обход может не
+        // дойти до конца, и тогда уведомление висело бы до следующего
+        // удачного. Вычитание, а не сравнение - счётчик тиков переполняется.
+        if (!g_debug && g_notice[0] && (LONG)(GetTickCount() - g_noticeUntil) >= 0) {
+            g_notice[0] = 0;
+            InterlockedExchange(&g_hudOn, 0);
+        }
+
         // Дальше - клавиши разработчика. Их много, они шумят в лог и часть из
         // них лезет в память игры, поэтому в готовой сборке они молчат.
         if (!g_debug) { Sleep(20); continue; }
@@ -5002,6 +5553,18 @@ static DWORD WINAPI worker(LPVOID) {
             L("[key] Numpad6 - ищу наведённую цель игры");
         }
         pNum6 = num6;
+        // Сторож памяти на узел + запись аргументов зарядки. Раньше висел на
+        // F11, но та ушла под настраиваемую клавишу пачки и до разведки больше
+        // не доходила. Numpad3 свободна.
+        static int pNum3 = 0;
+        int num3 = dev_down(VK_NUMPAD3);
+        if (num3 && !pNum3) {
+            InterlockedExchange(&g_watchReq, 1);
+            InterlockedExchange(&g_armLeft, 20000);
+            InterlockedExchange(&g_scanRequested, 1);
+            L("[key] Numpad3 - сторож на узел + запись аргументов зарядки");
+        }
+        pNum3 = num3;
         static int pNum2 = 0;
         int num2 = dev_down(VK_NUMPAD2);
         if (num2 && !pNum2) {
@@ -5027,9 +5590,23 @@ static DWORD WINAPI worker(LPVOID) {
             L("[key] Numpad5 - попытка зарядить ближайший узел");
         }
         pNum5 = num5;
+        // Numpad4 - перебор способов зарядить узел. Каждое нажатие пробует
+        // следующий и печатает, наполнился ли узел. Берёт то, на что смотришь,
+        // а если прицела нет - ближайший незаряженный.
+        static int pNum4 = 0;
+        int num4 = dev_down(VK_NUMPAD4);
+        if (num4 && !pNum4) {
+            InterlockedExchange(&g_armVarReq, 1);
+            InterlockedExchange(&g_armAimReq, 1);
+            InterlockedExchange(&g_scanRequested, 1);
+            L("[key] Numpad4 - следующий способ зарядки (%d из %d): %s",
+              (int)InterlockedCompareExchange(&g_armVar, 0, 0), ARM_VARIANTS,
+              arm_var_name((int)InterlockedCompareExchange(&g_armVar, 0, 0)));
+        }
+        pNum4 = num4;
         if (f11 && !pF11) {
             InterlockedExchange(&g_watchReq, 1);
-            InterlockedExchange(&g_armLeft, 30);
+            InterlockedExchange(&g_armLeft, 20000);
             L("[key] F11 - сторож на узел + запись аргументов зарядки");
         }
         pF11 = f11;
@@ -5151,15 +5728,55 @@ CDEXPORT int CoreStart(const char *dir, int generation) {
     hook_prologue(g_ownHook, g_fn.ownCheck, (void *)cdloot_on_own, 15, "оракул воровства");
     // Диспетчер зарядки узла. Пролог: mov [rsp+18],rbx / mov [rsp+10],dl /
     // push rbp,rsi,rdi,r12 = ровно 15 байт, ссылок на rip нет.
+    // 2.01.00 (exe 2760): диспетчер пересобран целиком. Прежний пролог
+    //   48 89 5C 24 18 88 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ?? 48 81 EC 00 01 00 00
+    // исчез. Теперь функция начинается с записи режима (dl) и rcx в теневую
+    // область, восьми push и sub rsp,58; сидит по +0x205CD60. Виртуальный
+    // вызов внутри съехал с +0x830/+0x838 на +0x838/+0x840 - в таблицу
+    // добавили метод. Аргументы прежние: rcx объект, dl режим, r8 буфер,
+    // r9d eid. Байты регистров подстановочные.
     unsigned char *armFn = aob("зарядка узла",
-        "48 89 5C 24 18 88 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ?? 48 81 EC 00 01 00 00");
-    // 16 байт, не 15: на 15 разрезается пополам "push r13" (41 55), и возврат
-    // уходит в середину инструкции. Одна такая ошибка уже уронила игру.
-    //   48 89 5C 24 18 (5) + 88 54 24 10 (4) + 55 56 57 (3) + 41 54 (2) + 41 55 (2)
+        "88 54 24 10 48 89 4C 24 08 53 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 58 49 8B ?? 44 0F B6 ?? 4C 8B ??");
+    // 15 байт ровно по границе инструкций:
+    //   88 54 24 10 (4) + 48 89 4C 24 08 (5) + 53 55 56 57 (4) + 41 54 (2) = 15.
+    // Ни одной rip-относительной ссылки. Резать на 16 нельзя: "41 55"
+    // (push r13) разрежется пополам - такая ошибка уже роняла игру.
+    find_actor_manager_vtables();
     resolve_item_table();
     resolve_aim_query();
     g_armFn = armFn;
-    if (armFn) hook_prologue(g_armHook, armFn, (void *)cdloot_on_arm, 16, "зарядка узла");
+    if (armFn) {
+        find_arm_default(armFn);
+        hook_prologue(g_armHook, armFn, (void *)cdloot_on_arm, 15, "зарядка узла");
+    }
+
+    // Диспетчер зарядки: это он у игры зовёт нужный виртуальный метод. Сам
+    // мод его не зовёт - слишком много аргументов неизвестного смысла, - но
+    // именно из его тела берётся номер метода. Так номер не зашит в мод и
+    // переживёт перестановку таблицы в следующем патче.
+    //   пролог: mov [rsp+18],rbx / mov [rsp+10],dl / восемь push /
+    //           mov rbp,rsp / sub rsp,?? / mov ebx,r9d / mov r14,r8 /
+    //           movzx esi,dl / mov r15,rcx
+    unsigned char *disp = aob("диспетчер зарядки",
+        "48 89 5C 24 18 88 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 8B EC"
+        " 48 81 EC ?? ?? ?? ?? 41 8B D9 4D 8B F0 0F B6 F2 4C 8B F9");
+    if (disp) {
+        // В теле два виртуальных вызова: один для вида 2, другой для вида 0.
+        // Нам нужен вид 0 - у него меньшее смещение.
+        int best = 0;
+        for (int i = 0; i + 6 < 0x120; i++) {
+            if (disp[i] != 0xFF) continue;
+            if (disp[i+1] < 0x90 || disp[i+1] > 0x97) continue;
+            int off2 = *(int32_t *)(disp + i + 2);
+            if (off2 < 0x100 || off2 > 0x2000) continue;
+            L("[зарядка] в диспетчере вызов метода +0x%X", off2);
+            if (!best || off2 < best) best = off2;
+        }
+        g_armSlot = best;
+        if (best) L("[зарядка] метод компонента = +0x%X (из диспетчера +0x%llX)",
+                    best, (unsigned long long)(disp - g_game.base));
+        else      L("[зарядка] в диспетчере не нашлось вызова метода");
+    }
     InterlockedExchange(&g_ownLeft, 30);
 
     // Слушатель включён сразу и молча ждёт: как только вы подберёте что-то
@@ -5177,10 +5794,15 @@ CDEXPORT int CoreStart(const char *dir, int generation) {
         L("[время] одна проверка памяти = %.1f мкс",
           (double)(b.QuadPart - a.QuadPart) * 1000000.0 / g_qpcFreq / 1000.0);
     }
+    // Секция плашки - ДО рабочего потока: он с первого же оборота может
+    // нажать клавишу и позвать notice(), а тот теперь пишет текст сам.
+    InitializeCriticalSection(&g_hudCs);
     InterlockedExchange(&g_running, 1);
     g_thread = CreateThread(0, 0, worker, 0, 0, 0);
-    InitializeCriticalSection(&g_hudCs);
-    hud_set("CDLoot готов");
+    // Табличка загрузки - единственное, что игрок видит до первого нажатия,
+    // и она одна осталась мимо T(): на английской системе мод здоровался
+    // по-русски. cfg_load выше уже выставил g_lang, так что выбор работает.
+    hud_set("%s", T("CDLoot ready", "CDLoot готов"));
     InterlockedExchange(&g_hudRunning, 1);
     g_hudThread = CreateThread(0, 0, hud_thread, 0, 0, 0);
 #ifdef CDLOOT_PLUGIN

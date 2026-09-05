@@ -235,12 +235,19 @@ static void *rip_target(unsigned char *insn, int dispOff, int insnLen) {
 }
 
 static bool resolve_functions() {
-    unsigned char *tlsDesc = aob("tls+desc",
-        "48 83 EC 28 BA 9C 00 00 00 65 48 8B 04 25 58 00 00 00 48 8B 08 8B 04 0A 39 05 ?? ?? ?? ?? "
-        "7E ?? 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? FF 75 ?? 48 8D 0D ?? ?? ?? ?? "
-        "E8 ?? ?? ?? ?? 90 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? 48 83 C4 28 C3 "
-        "CC CC CC CC CC CC 40 56 45 33 C9 44 0F B7 D2");
-    if (tlsDesc) { g_fn.tlsInit = tlsDesc; g_fn.descLookup = tlsDesc + 0x60; }
+    // tls+desc больше НЕ ищется своим шаблоном. Он был самым длинным и хрупким
+    // в моде: захватывал тело функции целиком плюс начало следующей, и на
+    // сборке 2760 умер от смены распределения регистров.
+    // Обе функции выводятся из места вызова, которое мы и так находим ниже
+    // (desc_mask+queue). Оно устроено так:
+    //     +0x00  E8 rel32              -> инициализация TLS
+    //     +0x05  44 8B 05 rel32        -> DESC_MASK
+    //     +0x0C  0F B7 54 24 xx
+    //     +0x11  E8 rel32              -> поиск дескриптора
+    //     +0x16  4C 8B 25 rel32        -> очередь
+    // Проверено на 2760: разница между двумя вызовами ровно 0x60, ровно как и
+    // было зашито прежним кодом (descLookup = tls + 0x60). То есть одно место
+    // вызова заменяет собой целую сигнатуру.
     g_fn.allocEvent = aob("alloc_event",
         "48 89 5C 24 ?? 4C 89 44 24 ?? 57 48 83 EC 20 8B ?? BA ?? ?? 00 00");
     g_fn.enqueue = aob("enqueue",
@@ -257,9 +264,24 @@ static bool resolve_functions() {
     }
     // Эти две функции перехватывает AutoLoot: если он загружен, их прологи
     // изменены и сигнатура не совпадёт. Для разработки CDLoot его лучше убрать.
-    g_fn.ownCheck = aob("own_check",
-        "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 55 41 54 41 55 41 56 41 57 48 8B EC "
-        "48 81 EC 80 00 00 00 49 8B F0 4C 8B FA");
+    // own_check тоже берём из места вызова, а не по телу функции. Это те самые
+    // ворота кражи: игра читает у объекта поле +0x120, зовёт проверку и по
+    // ответу решает, показать "Взять" или "Украсть".
+    //     48 8B 89 20 01 00 00   mov rcx,[rcx+0x120]
+    //     E8 rel32               call own_check
+    //     84 C0                  test al,al
+    //     74 04                  jz +4
+    //     B3 02                  mov bl,2
+    // На 2760 такое место в образе ровно одно.
+    {
+        unsigned char *site = aob("own_check_site",
+            "48 8B 89 20 01 00 00 E8 ?? ?? ?? ?? 84 C0 74 04 B3 02");
+        if (site) {
+            g_fn.ownCheck = site + 7 + 5 + *(int32_t *)(site + 8);
+            L("[aob] own_check = +0x%llX (из места вызова)",
+              (unsigned long long)(g_fn.ownCheck - g_game.base));
+        }
+    }
     g_fn.getPos = aob("get_pos",
         "40 53 48 83 EC 50 48 8B 41 68 48 8B 88 ?? 01 00 00 48 8B 01");
     // DESC_MASK и очередь берём из кода, а не зашиваем: они переезжают каждый патч.
@@ -273,6 +295,12 @@ static bool resolve_functions() {
     if (dq) {
         g_fn.descMask = (uint32_t *)rip_target(dq + 5,  3, 7);
         g_fn.queue    = (void **)  rip_target(dq + 22, 3, 7);
+        // Цель прямого вызова: адрес = байт после инструкции + смещение.
+        g_fn.tlsInit    = dq + 5      + *(int32_t *)(dq + 1);
+        g_fn.descLookup = dq + 17 + 5 + *(int32_t *)(dq + 18);
+        L("[aob] tls_init = +0x%llX, desc_lookup = +0x%llX (из места вызова)",
+          (unsigned long long)(g_fn.tlsInit - g_game.base),
+          (unsigned long long)(g_fn.descLookup - g_game.base));
         L("[aob] DESC_MASK = +0x%llX, очередь = +0x%llX",
           (unsigned long long)((unsigned char *)g_fn.descMask - g_game.base),
           (unsigned long long)((unsigned char *)g_fn.queue - g_game.base));
@@ -930,6 +958,7 @@ static void *build_event(Action act, uint32_t targetEid, uint32_t playerEid,
 // На игровом потоке ОБЯЗАНЫ выполняться две вещи: сборка и отправка события
 // (она зовёт функции игры и её очередь) и зарядка узла. Их наш поток кладёт в
 // очередь, а хук разбирает и выполняет.
+static volatile LONG  g_armLastEid;           // чей узел кладём в очередь
 static void          *volatile g_ctxLatest;   // последний контекст от игры
 static volatile LONG  g_gameTid;              // поток, на котором нас зовёт игра
 static volatile LONG  g_offThread = 1;        // ключ ScanOffThread
@@ -1285,19 +1314,26 @@ typedef void (*FnArm)(void *, uintptr_t, void *, uintptr_t);
 // деструктором (секундомер), а __try с ними в одном теле не уживается.
 static bool arm_call_now(void *inter, uintptr_t mode, void *scratch, uintptr_t eid);
 
-static bool arm_call(void *inter, uintptr_t mode, void *scratch, uintptr_t eid) {
+// Возвращает: 1 - вызвали прямо сейчас, 2 - поставили в очередь (исполнит
+// хук в ближайшем кадре), 0 - исключение внутри вызова.
+// Различать обязательно: при отложенном вызове проверять результат СРАЗУ
+// бессмысленно - данные узла ещё не появились. Раньше этого различия не было,
+// и после переноса обхода в свой поток мод видел "без изменений" и заносил
+// рудные жилы в чёрный список навсегда. Руда перестала собираться.
+static int arm_call(void *inter, uintptr_t mode, void *scratch, uintptr_t eid) {
     if (!on_game_thread()) {
         pend_init();
         EnterCriticalSection(&g_pendCs);
         bool room = g_pendArmN < 32;
         if (room) {
             PendArm &q = g_pendArm[g_pendArmN++];
-            q.node = inter; q.mode = mode; q.player = (uint32_t)eid; q.eid = 0;
+            q.node = inter; q.mode = mode; q.player = (uint32_t)eid;
+            q.eid = InterlockedCompareExchange(&g_armLastEid, 0, 0);
         }
         LeaveCriticalSection(&g_pendCs);
-        return room;                 // считаем удачей: вызов состоится в хуке
+        return room ? 2 : 0;         // 2 - отложено, исполнит хук
     }
-    return arm_call_now(inter, mode, scratch, eid);
+    return arm_call_now(inter, mode, scratch, eid) ? 1 : 0;
 }
 
 static bool arm_call_now(void *inter, uintptr_t mode, void *scratch, uintptr_t eid) {
@@ -1726,11 +1762,9 @@ static void inventory_refresh(unsigned char *me, bool verbose) {
                 // По просьбе: выложить сумку с номерами типов и именами.
                 // Нужно, чтобы найти конкретную вещь (Axiom Bracelet) и
                 // поставить на неё прямой запрет по имени.
-                if (verbose && slots <= 1024) {
-                    const char *nm = item_type_name(type);
-                    L("    [сумка] тип %5u (0x%04X) экз %08X  %s", type, type, iid,
-                      nm ? nm : "имя не читается");
-                }
+                // Дамп сумки убран: он выкладывал тысячу строк на каждый
+                // обзор и топил в себе всё остальное. Своё он отработал -
+                // по нему нашлись Visione_Chip и семейство AbyssGear.
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_faults); return; }
@@ -2428,6 +2462,12 @@ typedef bool (*FnOwnCheck)(void *, void *, void *, void *, long long);
 // отвечаем "не кража": лучше собрать лишнее, чем молча ничего не собирать.
 static volatile LONG g_stealLog;     // сколько ответов оракула ещё записать
 
+// Готов ли оракул. Пока игра ни разу не позвала свою проверку владельца,
+// мы не знаем о собственности ничего.
+static bool oracle_ready(void) {
+    return g_fn.ownCheck && g_ownCtx && g_ownTag && g_meEnt;
+}
+
 static bool would_steal(void *target) {
     // Оракул не готов - считаем ВОРОВСТВОМ и не берём. Раньше здесь стояло
     // "не кража", и любая поломка означала, что мод спокойно обчищает чужое:
@@ -2900,7 +2940,23 @@ static const char *skip_reason(const Cand &c, Action *out) {
     // Владелец - последним: вызов в игру дороже всех проверок выше, и звать
     // его есть смысл только для того, что мы иначе взяли бы. Оракул тот же,
     // которым игра решает, показать «Взять» или «Украсть».
-    if (!g_cfg.lootOwned && would_steal(c.ent)) return "чужое, будет розыск";
+    // Оракул наполняется только тогда, когда игра сама зовёт свою проверку
+    // владельца - а делает она это, решая, показать "Взять" или "Украсть".
+    // В чистом поле у рудной жилы такого повода нет, и мод оставался слепым:
+    // всё подряд считалось чужим, и руда не собиралась вовсе. Именно на это
+    // жаловались "стою прямо на жиле, не подбирает в 95% случаев".
+    //
+    // Пока оракул молчит, отказываем только ПОДБОРУ вещей - воровать можно
+    // именно их, и именно они лежат в чужих домах. Сбор растений и руды
+    // пропускаем: дикая жила и куст никому не принадлежат, а осторожность,
+    // которая выключает половину мода, - плохая осторожность.
+    if (!g_cfg.lootOwned) {
+        if (!oracle_ready()) {
+            if (*out != ACT_GATHER) return "владелец неизвестен, вещи не беру";
+        } else if (would_steal(c.ent)) {
+            return "чужое, будет розыск";
+        }
+    }
     return 0;
 }
 
@@ -3319,7 +3375,10 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
                 LONG mode = InterlockedCompareExchange(&g_armMode, 0, 0);
                 L("[зарядка] зову для eid=%08X (%.1f м), узел=%p, режим=%ld, игрок=%08X",
                   aeid, ad, inter2, mode, playerEid);
-                if (arm_call(inter2, (uintptr_t)mode, scratch, (uintptr_t)playerEid)) {
+                int r = arm_call(inter2, (uintptr_t)mode, scratch, (uintptr_t)playerEid);
+                if (r == 2) {
+                    L("[зарядка] поставлена в очередь - исполнит игровой поток");
+                } else if (r == 1) {
                     void *after = deref(inter2, INTER_GATHER);
                     L("[зарядка] вернулась. данные сбора: было %p, стало %p%s",
                       before, after, (before != after) ? "  <- ЗАРЯДИЛОСЬ" : "");
@@ -4520,18 +4579,23 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
                 static __declspec(align(16)) unsigned char scratch[256];
                 memset(scratch, 0, sizeof scratch);
                 arm_mark(key, now);
-                bool ok = arm_call(g2, (uintptr_t)InterlockedCompareExchange(&g_armMode, 0, 0),
-                                   scratch, (uintptr_t)playerEid);
+                InterlockedExchange(&g_armLastEid, (LONG)k.eid);
+                int ok = arm_call(g2, (uintptr_t)InterlockedCompareExchange(&g_armMode, 0, 0),
+                                  scratch, (uintptr_t)playerEid);
                 void *after = deref(g2, INTER_GATHER);
                 L("[зарядка] авто: eid=%08X %.1f м -> %s", k.eid, k.d,
-                  !ok ? "исключение" : (after ? "заряжено" : "без изменений"));
+                  ok == 0 ? "исключение" :
+                  ok == 2 ? "в очередь, проверим позже" :
+                  (after ? "заряжено" : "без изменений"));
                 // Узел, который после зарядки так и остался пустым, добычей
                 // не является. Рудная жила отвечает данными сбора сразу же, а
                 // сундук не отвечает ничем - ни закрытый, ни открытый руками:
                 // он контейнер, а не предмет, и имени у него нет вовсе.
                 // Помним такие навсегда, иначе мод будет ковырять каждый
                 // сундук и шкаф в комнате по кругу.
-                if (ok && !after) {
+                // Судим только по НАСТОЯЩЕМУ вызову. Отложенный (ok == 2)
+                // ещё не выполнен, и его пустой результат ничего не значит.
+                if (ok == 1 && !after) {
                     mark_searched(key);
                     L("[зарядка] eid=%08X не поддаётся зарядке - это не добыча,"
                       " больше не трогаю", k.eid);
@@ -4653,7 +4717,15 @@ static void drain_pending(void) {
         if (!arms[i].node || !readable(arms[i].node, 0x400)) continue;
         static __declspec(align(16)) unsigned char scratch[256];
         memset(scratch, 0, sizeof scratch);
-        arm_call_now(arms[i].node, arms[i].mode, scratch, arms[i].player);
+        void *before = deref(arms[i].node, INTER_GATHER);
+        bool ok = arm_call_now(arms[i].node, arms[i].mode, scratch, arms[i].player);
+        void *after = deref(arms[i].node, INTER_GATHER);
+        // Отложенная зарядка исполняется здесь, и только тут видно, сработала
+        // ли она на самом деле. Без этой строки мы вслепую гадали, почему не
+        // собирается руда.
+        L("[зарядка] исполнено на игровом потоке: eid=%08X %s (было %p, стало %p)",
+          arms[i].eid, !ok ? "ИСКЛЮЧЕНИЕ" : (after ? "заряжено" : "без изменений"),
+          before, after);
     }
     for (int i = 0; i < actN; i++)
         send_action((Action)acts[i].act, acts[i].eid, acts[i].player,

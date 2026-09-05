@@ -3088,13 +3088,33 @@ static const char *skip_reason(const Cand &c, Action *out) {
     // нельзя: мебель с выпадающим набором, сундуки, ящики и visione-триггеры
     // (места, где игра проигрывает особую анимацию памяти).
     if (c.nodeName) {
-        static const char *nodeBan[] = { "visione", "quest", "artifact" };
-        for (int i = 0; i < 3; i++)
+        // Счёт по sizeof, а не числом: список правился уже трижды, и однажды
+        // добавленное слово осталось непроверяемым, потому что предел забыли.
+        static const char *nodeBan[] = { "visione", "quest", "artifact",
+                                         // Повозка торговца и её части. Мод
+                                         // разбирал её по досочкам: в логе
+                                         // wagon_door_parts, Shop_Carriage_
+                                         // BaseCamp, Shop_Supplies_BaseCamp.
+                                         // Это не добыча, а работающая лавка.
+                                         "wagon", "carriage", "shop_",
+                                         // Знамя Сивогривых и его подставка:
+                                         // Graymaneflag_0001_Phase01_00_0001 и
+                                         // GraymaneFlagStand_0001_...  Одного
+                                         // слова хватает на оба - у подставки
+                                         // оно внутри имени.
+                                         "graymaneflag",
+                                         // Квестовые вещи зовутся не quest, а
+                                         // alias_Mission_*: alias_Mission_
+                                         // BloodCoronation_Document прошёл мимо
+                                         // фильтра "quest" и уехал в сумку.
+                                         "mission" };
+        for (int i = 0; i < (int)(sizeof nodeBan / sizeof nodeBan[0]); i++)
             if (stristr_ru(c.nodeName, nodeBan[i]))
-                return "триггер или квестовое - не трогаем";
+                return "повозка, триггер или квестовое - не трогаем";
         if (!g_cfg.lootFurnitureName) {
-            static const char *nodeFurn[] = { "furniture", "_chest", "_box", "dropset" };
-            for (int i = 0; i < 4; i++)
+            static const char *nodeFurn[] = { "furniture", "_chest", "_box", "dropset",
+                                              "lantern", "_lamp", "torch" };
+            for (int i = 0; i < (int)(sizeof nodeFurn / sizeof nodeFurn[0]); i++)
                 if (stristr_ru(c.nodeName, nodeFurn[i])) return "мебель или ящик, выключено";
         }
     }
@@ -3128,7 +3148,25 @@ static const char *skip_reason(const Cand &c, Action *out) {
                                            // человек откатил сохранение.
                                            // Внутренние имена: Item_Stat_
                                            // AbyssGear_*, Item_Skill_AbyssGear_*.
-                                           "abyssgear" };
+                                           "abyssgear",
+                                           // Повозка торговца целиком: дверцы,
+                                           // сама повозка, ящики с товаром.
+                                           // Игрок поймал, что мод тащит с неё
+                                           // фонарь, а по логу оказалось, что и
+                                           // wagon_door_parts, и Shop_Carriage_
+                                           // BaseCamp тоже. Лавка после этого
+                                           // остаётся без половины себя.
+                                           "wagon", "carriage",
+                                           "graymaneflag",
+                                           // Слово "quest" в именах квестовых
+                                           // вещей не встречается вовсе - игра
+                                           // зовёт их Mission. Ловим по нему,
+                                           // а не по частному BloodCoronation:
+                                           // заданий много, документ был не
+                                           // последним. Ложное срабатывание
+                                           // стоит "возьмите руками", промах -
+                                           // сломанного задания.
+                                           "mission" };
         for (int i = 0; i < (int)(sizeof forbidden / sizeof forbidden[0]); i++)
             if (stristr_ru(c.name, forbidden[i]))
                 return "механизм, квест, артефакт или рецепт - только руками";
@@ -3165,7 +3203,13 @@ static const char *skip_reason(const Cand &c, Action *out) {
                                           "item_background",
                                           // Светильники: факел взят живьём,
                                           // Collection_Lamp_* уже выше.
-                                          "torch", "_lamp" };
+                                          "torch", "_lamp",
+                                          // Фонарь. В списке были лампа, свеча
+                                          // и факел, а самого фонаря не было:
+                                          // свой, надетый, отсеивался правилом
+                                          // "наше", и дырка не показывалась,
+                                          // пока мод не снял чужой с повозки.
+                                          "lantern" };
             for (int i = 0; i < (int)(sizeof furn / sizeof furn[0]); i++)
                 if (stristr_ru(c.name, furn[i])) return "мебель, выключено";
         }
@@ -4981,6 +5025,21 @@ static void area_body(void *ctx, void *a2, void *a3, void *a4) {
                 Cand &k = list[i];
                 if (k.item || k.gather || !k.inter) continue;
                 if (k.parent == g_meEid || k.twin || k.heap) continue;
+                // Заряжаем только то, что НИ НА ЧЁМ НЕ ВИСИТ.
+                //
+                // Зарядка - это не "разбудить добычу", а "вписать в узел
+                // запись о добыче". Работает она на чём угодно: мод вписал её
+                // в фонари на строении (девять штук на одном родителе
+                // B0100037), в дверцы повозки, в знамя - и сам же всё это
+                // собрал как растения. По имени такое не отсечь: имени у них
+                // нет, а "тип" в логе - наша же метка.
+                //
+                // Родитель и есть признак. Рудная жила и куст стоят в мире
+                // сами по себе, род=00000000. Фонарь висит на доме, дверца на
+                // повозке, знамя на подставке - у них род не пуст. Настоящей
+                // добыче зарядка от этого не теряется: то, что уже собирается,
+                // сюда не доходит вовсе (k.gather выше).
+                if (k.parent) continue;
                 float armLim = g_cfg.armRange > 0.0f ? g_cfg.armRange
                                                      : g_cfg.range[ACT_GATHER];
                 if (k.d > armLim) continue;
